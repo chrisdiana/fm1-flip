@@ -1,0 +1,30 @@
+.pio/
+__pycache__/
+*.pyc
+.DS_Store
+.cache/
+build/
+
+# Local credentials, editor state and private configuration
+.env
+.env.*
+!.env.example
+!.env.sample
+.venv/
+venv/
+.vscode/
+*.key
+*.p12
+*.pfx
+
+# Device exports, downloaded firmware and runtime diagnostics
+/fm1/
+/backups/
+*.fwsc
+*.fwsc.json
+backup-*.bin
+backup-*.json
+*.log
+
+# Local hardware upload history
+/docs/FLASH-LOG.md
