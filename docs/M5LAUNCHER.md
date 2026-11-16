@@ -1,12 +1,11 @@
 # FM-1 Flip for M5Launcher
 
-Use the binary for your exact board. All three targets are **ESP32-S3 with 8 MiB flash**; these builds do not support StickC, StickC Plus or StickC Plus2.
+Use the StickS3 binary for StickS3, or the shared Cardputer binary for either original Cardputer or Cardputer ADV. Both targets are **ESP32-S3 with 8 MiB flash**; these builds do not support StickC, StickC Plus or StickC Plus2.
 
 | Board | File | Format |
 | --- | --- | --- |
 | StickS3 | `fm1-flip-sticks3-m5launcher.bin` | Merged image with app and internal-storage partition metadata |
-| Original Cardputer | `fm1-flip-cardputer-m5launcher.bin` | App-only image; firmware library uses microSD |
-| Cardputer ADV | `fm1-flip-cardputer-adv-m5launcher.bin` | App-only image; firmware library uses microSD |
+| Cardputer / Cardputer ADV | `fm1-flip-cardputer-m5launcher.bin` | App-only image; firmware library uses microSD |
 
 `fm1-flip-m5launcher.zip` contains these images, this guide, a manifest and `SHA256SUMS`. Extract it before installing. Generated files are under `build/releases/m5launcher/` in a source checkout.
 
@@ -30,7 +29,7 @@ StickS3's available package space under Launcher depends on its other app/data p
 From the project root:
 
 ```sh
-pio run -e sticks3 -e cardputer -e cardputer-adv
+pio run -e sticks3 -e cardputer
 python3 tools/package_launcher.py
 ```
 

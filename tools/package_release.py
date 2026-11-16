@@ -3,10 +3,12 @@
 import argparse, hashlib, json, pathlib, subprocess, sys
 root=pathlib.Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser(description=__doc__)
-p.add_argument('boards',nargs='*',default=['cardputer-adv','sticks3','cardputer'],choices=['cardputer-adv','sticks3','cardputer'])
+p.add_argument('boards',nargs='*',default=['sticks3','cardputer'],choices=['cardputer-adv','sticks3','cardputer'])
 p.add_argument('--esptool',type=pathlib.Path,default=pathlib.Path.home()/'.platformio/packages/tool-esptoolpy/esptool.py')
 a=p.parse_args()
 out=root/'build/releases';out.mkdir(parents=True,exist_ok=True)
+# Remove the obsolete generated ADV-only artifact after target consolidation.
+(out/'fm1-flip-cardputer-adv-factory.bin').unlink(missing_ok=True)
 manifest={}
 inputs = sorted([root/'platformio.ini', root/'tools/embed_assets.py', root/'web/index.html',
                  *(root/'src').rglob('*'), *(root/'include').rglob('*'), *(root/'partitions').glob('*.csv')])
@@ -14,7 +16,7 @@ inputs = [path for path in inputs if path.is_file()]
 source_hash=hashlib.sha256()
 for path in inputs:
     source_hash.update(path.relative_to(root).as_posix().encode()+b'\0'+path.read_bytes()+b'\0')
-for board in a.boards:
+for board in dict.fromkeys('cardputer' if board=='cardputer-adv' else board for board in a.boards):
     build=root/'.pio/build'/board
     for name in ['bootloader.bin','partitions.bin','firmware.bin']:
         if not (build/name).is_file(): raise SystemExit('Build first: pio run -e '+board)

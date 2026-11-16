@@ -272,9 +272,9 @@ void exportTick(){if(!exportActive)return;int ready=exportClient.availableForWri
 } // namespace
 void appSetup(){
  auto cfg=M5.config();cfg.internal_spk=false;cfg.internal_mic=false;
-#ifdef FM1_CARDPUTER_ADV
- cfg.fallback_board=m5::board_t::board_M5CardputerADV;
-#elif defined(FM1_CARDPUTER)
+#ifdef FM1_CARDPUTER
+ // M5Unified/M5GFX detect original versus ADV before using this fallback.
+ // M5Cardputer then selects the matching keyboard reader at runtime.
  cfg.fallback_board=m5::board_t::board_M5Cardputer;
 #else
  cfg.fallback_board=m5::board_t::board_M5StickS3;

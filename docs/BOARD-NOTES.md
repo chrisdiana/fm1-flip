@@ -2,7 +2,7 @@
 
 ## Confirmed from source and published documentation
 
-Both Cardputer variants use 8 MiB ESP32-S3 modules. Their SD pins match: CS12, MOSI14, CLK40, MISO39. Their keyboard hardware differs: the original uses a matrix reader, while ADV uses a TCA8418 over I2C. Pinned M5Cardputer 1.1.1 contains both readers. M5Unified/M5GFX identify the board, with a per-target fallback selected by this app.
+Both Cardputer variants use 8 MiB ESP32-S3 modules. Their SD pins match: CS12, MOSI14, CLK40, MISO39. Their keyboard hardware differs: the original uses a matrix reader, while ADV uses a TCA8418 over I2C. Pinned M5Cardputer 1.1.1 contains both readers. M5Unified/M5GFX identify the board before using a fallback. A single Cardputer build contains both keyboard readers and chooses at runtime; it is shared by original Cardputer and ADV. The legacy cardputer-adv environment is an alias, not a separate release target.
 
 - [Original Cardputer documentation and pin map](https://docs.m5stack.com/en/core/Cardputer)
 - [ADV documentation and pin map](https://docs.m5stack.com/en/core/Cardputer-Adv)

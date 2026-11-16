@@ -10,7 +10,7 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-BOARDS = ('sticks3', 'cardputer', 'cardputer-adv')
+BOARDS = ('sticks3', 'cardputer')
 
 
 def verify_app(data, offset=0):
@@ -82,6 +82,7 @@ def main():
     factories = json.loads((releases / 'manifest.json').read_text())
     output = releases / 'm5launcher'
     output.mkdir(parents=True, exist_ok=True)
+    (output / 'fm1-flip-cardputer-adv-m5launcher.bin').unlink(missing_ok=True)
     manifest = {'project': 'FM-1 Flip', 'formatVersion': 1,
                 'launcherHardwareValidated': False, 'images': {}}
     for board in BOARDS:
@@ -101,7 +102,8 @@ def main():
         name = f'fm1-flip-{board}-m5launcher.bin'
         (output / name).write_bytes(data)
         manifest['images'][name] = {
-            'board': board, 'chip': 'esp32s3', 'bytes': len(data),
+            'board': board, 'supportedBoards': ['cardputer', 'cardputer-adv'] if board == 'cardputer' else ['sticks3'],
+            'chip': 'esp32s3', 'bytes': len(data),
             'sha256': hashlib.sha256(data).hexdigest(),
             'sourceSha256': factories[factory_name]['sourceSha256'],
             'imageFormat': 'merged' if merged else 'app',

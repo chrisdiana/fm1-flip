@@ -13,12 +13,11 @@ Use the matching file in `build/releases/m5launcher/`:
 | Board | M5Launcher binary |
 | --- | --- |
 | StickS3 | `fm1-flip-sticks3-m5launcher.bin` |
-| Original Cardputer | `fm1-flip-cardputer-m5launcher.bin` |
-| Cardputer ADV | `fm1-flip-cardputer-adv-m5launcher.bin` |
+| Cardputer / Cardputer ADV | `fm1-flip-cardputer-m5launcher.bin` |
 
 Copy the file to SD and choose **SD → file → Install**, or upload through Launcher's **WUI**. StickS3 uses a merged image so Launcher can create its internal data partition; initialize storage through **Home → Storage & export** on first use if it does not mount. Cardputer uses an app-only image and a FAT32 microSD card. These packages target current dynamic-partition Launcher builds and still need physical Launcher installation testing.
 
-See [M5Launcher installation and packaging](docs/M5LAUNCHER.md) for exact setup, storage behavior and checksums. `python3 tools/package_launcher.py` creates the three files and `build/releases/fm1-flip-m5launcher.zip` from fresh builds. This packaging command never reads or flashes a device.
+See [M5Launcher installation and packaging](docs/M5LAUNCHER.md) for exact setup, storage behavior and checksums. `python3 tools/package_launcher.py` creates the two files and `build/releases/fm1-flip-m5launcher.zip` from fresh builds. This packaging command never reads or flashes a device.
 
 ## Quick start
 
@@ -174,11 +173,11 @@ Export `/fm1/logs/session-N.txt` through **Files & backups** when investigating 
 Install PlatformIO, then run from this directory:
 
 ```sh
-pio run -e cardputer-adv -e sticks3 -e cardputer
+pio run -e cardputer -e sticks3
 python3 tools/check.py
 # Optional real-browser frontend check with a local fixture API:
 python3 tools/check_web.py
-python3 tools/package_release.py cardputer-adv sticks3 cardputer
+python3 tools/package_release.py sticks3 cardputer
 ```
 
 On this host, the PlatformIO executable is `~/.platformio/penv/bin/pio` if `pio` is not on PATH.
