@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package clean build artifacts for M5Launcher; never read or flash a device."""
+"""Validate the two universal release images; never read or flash a device."""
 import hashlib
 import json
 import re
@@ -7,7 +7,6 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
-import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 BOARDS = ('sticks3', 'cardputer')
@@ -44,7 +43,10 @@ def verify_app(data, offset=0):
     return end + 32 - offset
 
 
-def verify_merged(data, app):
+def verify_merged(data, app, requires_storage=True):
+    if len(data) < 0x10000:
+        raise ValueError('Merged image requires bootloader, partition table and app')
+    verify_app(data, 0)
     table = data[0x8000:0x9000]
     entries, table_end = [], None
     for position in range(0, len(table), 32):
@@ -63,35 +65,43 @@ def verify_merged(data, app):
         raise ValueError('Missing partition-table MD5')
     apps = [entry for entry in entries if entry['type'] == 0]
     storage = [entry for entry in entries if entry['type'] == 1 and entry['label'] == 'spiffs']
-    if len(apps) != 1 or apps[0]['offset'] != 0x10000 or len(storage) != 1:
-        raise ValueError('Unexpected StickS3 application/storage layout')
+    if len(apps) != 1 or apps[0]['offset'] != 0x10000 or len(storage) != int(requires_storage):
+        raise ValueError('Unexpected application/storage layout')
     if data[0x10000:0x10000 + len(app)] != app:
         raise ValueError('Merged application differs from this build')
     verify_app(data, 0x10000)
     if any(byte != 0xFF for byte in data[0x9000:0xE000]):
         raise ValueError('NVS area is not erased: do not package device settings')
     # Deliberately no runtime filesystem dump: Launcher creates this partition.
-    if len(data) > storage[0]['offset']:
+    if requires_storage and len(data) > storage[0]['offset']:
         raise ValueError('Unexpected filesystem payload in clean merged build')
-    return storage[0]
+    return storage[0] if storage else None
 
 
-def main():
-    subprocess.run([sys.executable, str(ROOT / 'tools/package_release.py'), *BOARDS], check=True)
+def main(boards=BOARDS):
     releases = ROOT / 'build/releases'
-    factories = json.loads((releases / 'manifest.json').read_text())
-    output = releases / 'm5launcher'
-    output.mkdir(parents=True, exist_ok=True)
-    (output / 'fm1-flip-cardputer-adv-m5launcher.bin').unlink(missing_ok=True)
+    previous_path = releases / 'manifest.json'
+    previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+    subprocess.run([sys.executable, str(ROOT / 'tools/package_release.py'), *boards], check=True)
+    source_manifest = json.loads((releases / 'manifest.json').read_text())
+    output = releases
+    # Remove obsolete generated release variants; publish exactly two .bin files.
+    for pattern in ('fm1-flip-*-factory.bin', 'fm1-switcher-*-factory.bin'):
+        for old in output.glob(pattern):
+            old.unlink()
+    (output / 'fm1-flip-m5launcher.zip').unlink(missing_ok=True)
+    legacy = output / 'm5launcher'
+    if legacy.is_dir():
+        import shutil
+        shutil.rmtree(legacy)
     manifest = {'project': 'FM-1 Flip', 'formatVersion': 1,
-                'launcherHardwareValidated': False, 'images': {}}
-    for board in BOARDS:
+                'launcherHardwareValidated': False, 'images': previous.get('images', {})}
+    for board in boards:
         app = (ROOT / '.pio/build' / board / 'firmware.bin').read_bytes()
         verify_app(app)
-        merged = board == 'sticks3'
-        factory_name = f'fm1-flip-{board}-factory.bin'
-        data = (releases / factory_name).read_bytes() if merged else app
-        storage = verify_merged(data, app) if merged else None
+        factory_name = f'fm1-flip-{board}.bin'
+        data = (releases / factory_name).read_bytes()
+        storage = verify_merged(data, app, requires_storage=board == 'sticks3')
         for marker in (str(Path.home()).encode(), b'/Users/', b'/home/'):
             if marker in data:
                 raise ValueError(f'{board}: private build path/key marker in release image; rebuild with path mapping')
@@ -99,15 +109,15 @@ def main():
         # encoded key material, rather than that harmless delimiter by itself.
         if re.search(rb'-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\r?\n[A-Za-z0-9+/=\r\n]{32,}-----END ', data):
             raise ValueError(f'{board}: private key material in release image')
-        name = f'fm1-flip-{board}-m5launcher.bin'
+        name = f'fm1-flip-{board}.bin'
         (output / name).write_bytes(data)
         manifest['images'][name] = {
             'board': board, 'supportedBoards': ['cardputer', 'cardputer-adv'] if board == 'cardputer' else ['sticks3'],
             'chip': 'esp32s3', 'bytes': len(data),
             'sha256': hashlib.sha256(data).hexdigest(),
-            'sourceSha256': factories[factory_name]['sourceSha256'],
-            'imageFormat': 'merged' if merged else 'app',
-            'appOffsetInFile': 0x10000 if merged else 0,
+            'sourceSha256': source_manifest[factory_name]['sourceSha256'],
+            'imageFormat': 'merged',
+            'flashOffset': 0, 'appOffsetInFile': 0x10000,
             'appBytes': len(app),
             'storage': {'label': storage['label'], 'subtype': storage['subtype'],
                         'allocation': 'remaining free space; managed by Launcher',
@@ -118,15 +128,13 @@ def main():
     (output / 'SHA256SUMS').write_text(''.join(
         f"{entry['sha256']}  {name}\n" for name, entry in manifest['images'].items()))
     (output / 'README.md').write_text((ROOT / 'docs/M5LAUNCHER.md').read_text())
-    archive = releases / 'fm1-flip-m5launcher.zip'
-    names = [*manifest['images'], 'manifest.json', 'SHA256SUMS', 'README.md']
-    with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
-        for name in names:
-            bundle.write(output / name, name)
-    print('M5Launcher bundle:', archive.relative_to(ROOT))
+    print('Release images:', output.relative_to(ROOT))
     for name, entry in manifest['images'].items():
         print(name, entry['bytes'], 'bytes;', entry['imageFormat'])
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('boards', nargs='*', choices=BOARDS, default=list(BOARDS))
+    main(tuple(parser.parse_args().boards))

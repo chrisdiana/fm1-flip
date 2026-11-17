@@ -37,3 +37,13 @@ with tempfile.TemporaryDirectory(prefix='fm1-usb-handoff-') as name:
     (path/'main.cpp').write_text((root/'test/usb_handoff_adapter.hpp').read_text()+'\n'+callback+'\n'+handoff+'\n'+(root/'test/usb_handoff_main.hpp').read_text())
     subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', str(path/'main.cpp'), '-o', str(path/'test')], cwd=root, check=True)
     subprocess.run([str(path/'test')], cwd=root, check=True)
+
+# Exercise the production atomic cancellation gate in every operation phase.
+policy=source[source.index('bool transportCanCancel()'):source.index('uint64_t transportBackupReserve()')]
+with tempfile.TemporaryDirectory(prefix='fm1-cancel-gate-') as name:
+    path=Path(name)
+    (path/'main.cpp').write_text('#include <atomic>\n#include <cstdint>\n#include <cassert>\nstd::atomic<uint8_t> cancellation{0};\n'+policy+\
+        '\nint main(){for(uint8_t phase=0;phase<5;++phase){cancellation.store(phase);assert(transportCanCancel()==(phase==1||phase==3));assert(transportCancel()==(phase==1||phase==2||phase==3));}}')
+    subprocess.run(['c++','-std=c++17','-Wall','-Wextra','-Werror',str(path/'main.cpp'),'-o',str(path/'test')],check=True)
+    subprocess.run([str(path/'test')],check=True)
+    print('Production cancellation gate: preflight/write accepted, idle/reboot rejected')

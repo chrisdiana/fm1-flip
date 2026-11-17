@@ -84,6 +84,7 @@ class FakeFlash final : public fm1::Flash {
   bool eraseSector(uint32_t a) override {
     erased.push_back(a);
     if (eraseFail) return false;
+    if(cancelDuringErase)*cancelDuringErase=true;
     std::fill(bytes.begin() + a, bytes.begin() + a + 0x1000, 0xff);
     return true;
   }
@@ -92,11 +93,14 @@ class FakeFlash final : public fm1::Flash {
     std::memcpy(bytes.data() + a, p, n);
     if (badReadback) bytes[a] ^= 1;
     if (corruptProtected) bytes[0xff010] ^= 1;
+    if(cancelDuringProgram)*cancelDuringProgram=true;
     return true;
   }
   std::vector<uint8_t> bytes = std::vector<uint8_t>(0x100000, 0);
   std::vector<uint32_t> erased;
   uint32_t readCalls = 0, failReadAt = 0;
+  bool* cancelDuringErase=nullptr;
+  bool* cancelDuringProgram=nullptr;
   bool corruptProtected=false;
   bool readFail = false, eraseFail = false, programFail = false, badReadback = false;
 };
@@ -197,6 +201,18 @@ int main() {
       if(fault==6)assert(report.error==fm1::WriteError::ProtectedRegionMismatch);
     }
   }
+  // Cancel before erase, or finish an in-flight sector and stop before the next.
+  for(bool duringWrite : {false,true}) {
+    FakeFlash stopped;Reader source(packageFixture());bool stop=!duringWrite;
+    if(duringWrite)stopped.cancelDuringProgram=&stop;
+    auto cancelled=fm1::writePackageWithoutBackup(stopped,source,fm1::DeviceModel::Fm1,nullptr,&stop,
+      [](void* p){return *static_cast<bool*>(p);});
+    assert(cancelled.error==fm1::WriteError::Cancelled);
+    assert(stopped.erased.size()==(duringWrite?1u:0u));
+    assert(cancelled.changedSectors==(duringWrite?1u:0u));
+    if(duringWrite)assert(stopped.bytes[0x4000]==0x5a&&stopped.bytes[0x5000]==0);
+    assert(stopped.bytes[0]==0&&stopped.bytes[0xff000]==0);
+  }
   FakeFlash invalidDirect;Reader invalidSource(packageFixture());invalidSource.fail=true;
   assert(fm1::writePackageWithoutBackup(invalidDirect,invalidSource,fm1::DeviceModel::Fm1).error==fm1::WriteError::InvalidPackage);
   assert(invalidDirect.erased.empty());
@@ -210,6 +226,20 @@ int main() {
   assert(restored.error == fm1::WriteError::None && restored.changedSectors == 2);
   assert(restore.erased == std::vector<uint32_t>({0x4000, 0xfe000}));
   assert(restore.bytes == restoreDesired.bytes);
+  // A stop arriving during erase still programs/verifies that sector fully.
+  for(bool restoring : {false,true}) {
+    FakeFlash stopped;Reader current(stopped.bytes), desired(stopped.bytes), source(packageFixture());
+    desired.bytes[0x4000]=0x78;desired.bytes[0x5000]=0x34;
+    bool stop=false;stopped.cancelDuringErase=&stop;
+    auto check=[](void* p){return *static_cast<bool*>(p);};
+    auto report=restoring
+      ? fm1::restoreBackup(stopped,desired,current,crc32(0,desired.bytes.data(),desired.bytes.size()),expectedCrc(stopped),nullptr,&stop,check)
+      : fm1::writePackageWithoutBackup(stopped,source,fm1::DeviceModel::Fm1,nullptr,&stop,check);
+    assert(report.error==fm1::WriteError::Cancelled&&report.changedSectors==1);
+    assert(stopped.erased==std::vector<uint32_t>{0x4000});
+    assert(stopped.bytes[0x4000]==(restoring?0x78:0x5a)&&stopped.bytes[0x5000]==0);
+    assert(stopped.bytes[0]==0&&stopped.bytes[0xff000]==0);
+  }
   // A completed restore is idempotent with a fresh current verified backup.
   Reader freshCurrent(restore.bytes);
   restore.erased.clear();

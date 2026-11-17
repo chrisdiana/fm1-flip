@@ -24,6 +24,19 @@ DRIVER = r'''<script>
   assert(document.querySelector('#sort').value==='popular','Popularity must be the default sort');
   assert(document.querySelector('#list h3').textContent==='Firmware 31','Default popularity order was not requested');
   assert(document.querySelector('#list img'),'Maker artwork missing');
+  await navigate('settings');
+  const password=document.querySelector('#network input[name=password]');
+  password.value='fixture-password';
+  document.querySelector('#password-visibility').click();
+  assert(password.type==='text'&&password.value==='fixture-password','Password reveal failed');
+  document.querySelector('#password-visibility').click();
+  assert(password.type==='password'&&password.value==='fixture-password','Password hide failed');
+  password.value='';
+  document.querySelector('#hotspot-enabled').click();
+  await wait(()=>document.querySelector('#message').textContent==='Hotspot setting saved'&&document.querySelector('#hotspot-enabled').checked);
+  document.querySelector('#hotspot-enabled').click();
+  await wait(()=>!document.querySelector('#hotspot-enabled').checked);
+  await navigate('gallery');await wait(()=>document.querySelectorAll('#list article').length===16);
   document.querySelector('#next').click();await wait(()=>document.querySelector('#cache').textContent.includes('showing 17'));
   document.querySelector('#query').value='needle description';document.querySelector('#query').dispatchEvent(new Event('input'));
   await wait(()=>document.querySelector('#cache').textContent.startsWith('1 results'));
@@ -71,6 +84,7 @@ def main():
             downloadable=True,favorite=False,license='GPL-3.0-only',hubInstalls=(i+1)*10,artworkUrl='/fixture-card.svg' if i%2 else None,
             sourceUrl='https://github.com/maker/project',hubUrl='https://thefirmwarehub.com/'))
     requests=[]
+    hotspot={"enabled":False}
     library=[dict(records[0],saved=True),dict(records[1],id='local-legacy',name='Legacy saved firmware',version='0.7',saved=True,local=True)]
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self,*_): pass
@@ -84,7 +98,7 @@ def main():
             if url.path=='/fixture-card.svg':return self.reply('<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="640" height="360" fill="#244c55"/><circle cx="450" cy="180" r="130" fill="#73c7ae"/><path d="M0 250L640 100M0 270L640 120M0 290L640 140" stroke="#d4e0bb" stroke-width="3"/><text x="35" y="95" font-family="sans-serif" font-size="32" fill="white">TEST ARTWORK</text></svg>',kind='image/svg+xml')
             if url.path=='/api/library':return self.reply(dict(entries=library,total=len(library),storageLabel='fixture switcher'))
             if url.path=='/api/device':return self.reply(dict(current=dict(firmwareProduct='FM-1_918',firmwareKnown=True,firmwareLive=False,mode='disconnected'),record=dict(lastObserved=dict(product='FM-1_918'),history=[])))
-            if url.path=='/api/status': return self.reply(dict(stage='Fixture',detail='No hardware attached',storageReady=True,free=4000000,completed=0,total=0,canCancel=False,busy=False,targetFlashId=0,ap='127.0.0.1',station='127.0.0.1'))
+            if url.path=='/api/status': return self.reply(dict(stage='Fixture',detail='No hardware attached',storageReady=True,free=4000000,completed=0,total=0,canCancel=False,busy=False,targetFlashId=0,ap='127.0.0.1',station='127.0.0.1',apEnabled=hotspot['enabled'],wifiResult='Connected to fixture network'))
             if url.path=='/api/files': return self.reply([dict(path='/fm1/backups/backup-1.bin',size=1048576,deletableBackup=False)])
             if url.path=='/api/catalogue':
                 rows=[r for r in records if val('q').lower() in ' '.join([r['name'],r['author'],r['description'],*r['tags']]).lower()]
@@ -100,6 +114,9 @@ def main():
         def do_POST(self):
             body=self.rfile.read(int(self.headers.get('Content-Length',0))).decode()
             requests.append((self.path,urllib.parse.parse_qs(body)))
+            if self.path=='/api/hotspot':
+                hotspot['enabled']=urllib.parse.parse_qs(body).get('enabled')==['true']
+                return self.reply('Hotspot setting saved',202,'text/plain')
             if self.path=='/api/download': return self.reply('Download queued for fixture only',202,'text/plain')
             if self.path=='/api/restore': return self.reply('Restore armed; physical confirmation required',202,'text/plain')
             return self.reply('Unexpected action',400,'text/plain')
@@ -120,7 +137,8 @@ def main():
                 raise SystemExit('Web browser fixture failed: '+error+' '+run.stderr[-1000:])
         assert any(path=='/api/download' for path,_ in requests)
         assert any(path=='/api/restore' for path,_ in requests)
-        assert all(path in ('/api/download','/api/restore') for path,_ in requests)
+        assert all(path in ('/api/download','/api/restore','/api/hotspot') for path,_ in requests)
+        assert [data['enabled'] for path,data in requests if path=='/api/hotspot']==[['true'],['false']]
         print('Browser passed: default popularity, artwork, pagination, search/filters, separate downloaded library, stale-vs-live firmware, empty confirmed history, queued actions and safe metadata')
     finally:
         server.shutdown();server.server_close()

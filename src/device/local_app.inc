@@ -3,12 +3,14 @@
 namespace ui = device::presentation;
 namespace local = device::local;
 
-enum class LocalPage { Home, Wifi, Backups, BackupActions, History, Setup, Info };
+enum class LocalPage { Home, Wifi, Backups, BackupActions, History, Setup, WebUi, Info };
 enum class LocalConfirmation { None, Format, DeleteBackup };
 struct WifiChoice { String ssid; int rssi; bool open; };
 struct BackupChoice { String path; uint32_t size; uint32_t number; };
 
-M5Canvas screenBuffer(&DISPLAY);
+// M5Cardputer.Display is a reference initialized by another global constructor.
+// The underlying M5.Display object has a stable address before any constructors.
+M5Canvas screenBuffer(&M5.Display);
 #ifdef FM1_CARDPUTER
 ui::BufferedCanvas<M5Canvas> screenCanvas(screenBuffer, true);
 #else
@@ -21,7 +23,7 @@ LocalPage editorReturnPage = LocalPage::Home;
 LocalPage infoReturnPage = LocalPage::Home;
 bool homeMenu = true, editorReturnMenu = false;
 bool infoReturnMenu = false, infoReturnDetail = false, infoReturnHome = true;
-size_t homeIndex = 0;
+size_t homeIndex = 0, hotspotSelected = 0;
 LocalConfirmation localConfirmation = LocalConfirmation::None;
 String localConfirmationPath, localInfoTitle, localInfoBody;
 std::vector<WifiChoice> wifiChoices;
@@ -40,10 +42,10 @@ String lastNotice;
 uint32_t noticeUntil = 0;
 
 const char* LOCAL_ACTIONS[] = {
-    "Discover", "Downloaded", "Loaded on FM-1", "Search", "Favorite / unfavorite",
+    "Discover", "Downloaded", "Search", "Favorite / unfavorite",
     "Download package", "Install on FM-1", "Connect FM-1", "Create backup", "Backups",
     "Wi-Fi setup", "Refresh catalogue", "Category", "Release channel", "Chip support",
-    "Sort", "Favorites only", "Storage & export", "Last operation", "Home"
+    "Sort", "Favorites only", "Storage & export", "Web UI / hotspot", "Last operation", "Loaded on FM-1", "Home"
 };
 constexpr size_t LOCAL_ACTION_COUNT = sizeof(LOCAL_ACTIONS) / sizeof(LOCAL_ACTIONS[0]);
 
@@ -104,18 +106,53 @@ void completeEditor() {
         editingSsid = value;
         openEditor(local::EditTarget::Password, "", 63);
     } else {
-        preferences.putString("ssid", editingSsid);
-        preferences.putString("password", value);
-        WiFi.begin(editingSsid.c_str(), value.c_str());
-        wifiConnecting = true; wifiConnectStarted = millis();
-        localPage = LocalPage::Wifi;
-        notice = "Connecting to " + editingSsid;
+        startWifiJoin(editingSsid,value);
     }
     dirty = true;
 }
 
+void startWifiJoin(const String& ssid,const String& password) {
+    if(!wifiEnabled&&!setWifiPower(true,false)){showLocalInfo("Wi-Fi error","Could not enable the Wi-Fi radio.");return;}
+    preferences.putString("ssid",ssid);preferences.putString("password",password);
+    editingSsid=ssid;
+    WiFi.scanDelete();wifiScanning=false;
+    WiFi.disconnect(false);wifiDisconnectReason.store(0);
+    wifiResult="Joining Wi-Fi";wifiConnecting=true;wifiConnectStarted=millis();
+    searchPicker=false;actionMenu=false;localPage=LocalPage::Wifi;
+    WiFi.begin(ssid.c_str(),password.c_str());dirty=true;
+}
+
+String webAccessDetails() {
+    if(!wifiEnabled)return "Wi-Fi radio is OFF to save power. Turn Wi-Fi on here for browser access, or choose Download / Refresh to reconnect when needed.";
+    String result=apEnabled ? "Hotspot ON. Join FM1-Flip, password "+apPassword+". Open http://192.168.4.1. " : "Hotspot OFF; no FM1-Flip network is broadcast. ";
+    if(WiFi.status()==WL_CONNECTED)result+="Home-network browser address: http://"+WiFi.localIP().toString()+". ";
+    else result+="Join home Wi-Fi or enable the hotspot for browser access. ";
+    return result+"This setting is saved across restarts.";
+}
+
+void showHome();
+bool requestNetworkJob(const Job& next) {
+    if(locked())return false;
+    if(!wifiEnabled){
+        pendingNetworkJob=next;networkPrompt=true;networkPromptIndex=0;
+        actionMenu=false;searchPicker=false;detail=false;localPage=LocalPage::Home;dirty=true;return true;
+    }
+    return startJob(next);
+}
+
+void chooseNetworkPrompt() {
+    if(networkPromptIndex){networkPrompt=false;showHome();return;}
+    networkPrompt=false;
+    String ssid=preferences.getString("ssid","");
+    if(ssid.isEmpty()){showLocalInfo("Wi-Fi setup needed","No network is saved. Open Home > Wi-Fi setup, then retry the download or refresh.");return;}
+    if(!setWifiPower(true,false)){showLocalInfo("Wi-Fi error","Could not turn on the radio.");return;}
+    networkWaiting=true;networkReadyStarted=millis();
+    startWifiJoin(ssid,preferences.getString("password",""));
+}
+
 void beginWifiScan() {
     if (locked()) return;
+    if(!wifiEnabled&&!setWifiPower(true,false)){showLocalInfo("Wi-Fi error","Could not enable the radio.");return;}
     actionMenu = false;
     searchPicker = false;
     localPage = LocalPage::Wifi;
@@ -131,12 +168,24 @@ void beginWifiScan() {
 void pollWifiScan() {
     if (wifiConnecting) {
         int status = WiFi.status();
-        if (status == WL_CONNECTED) {
-            wifiConnecting = false; localPage = LocalPage::Home;
-            notice = "Wi-Fi connected"; dirty = true;
-        } else if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL || uint32_t(millis() - wifiConnectStarted) > 20000) {
-            wifiConnecting = false;
-            showLocalInfo("Wi-Fi not joined", "Check the network name and password, then try Wi-Fi setup again. The local access point remains available.");
+        if (status == WL_CONNECTED && uint32_t(WiFi.localIP())!=0) {
+            wifiConnecting=false;localPage=LocalPage::Home;actionMenu=true;homeMenu=true;
+            wifiResult="Connected: "+WiFi.localIP().toString();
+            if(networkWaiting)networkReadyStarted=millis();
+            dirty=true;
+        } else if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL || uint32_t(millis() - wifiConnectStarted) > 30000) {
+            wifiConnecting = false;networkWaiting=false;
+            wifiResult=wifiJoinFailure(status,wifiDisconnectReason.load());
+            WiFi.disconnect(false);
+            showLocalInfo("Wi-Fi not joined",wifiResult);
+        }
+    }
+    if(networkWaiting&&!wifiConnecting){
+        if(WiFi.status()==WL_CONNECTED && networkPreflight().isEmpty()){
+            networkWaiting=false;Job next=pendingNetworkJob;pendingNetworkJob=Job{};
+            if(!startJob(next))showLocalInfo("Download not started","Please select the firmware or refresh again.");
+        }else if(uint32_t(millis()-networkReadyStarted)>20000){
+            networkWaiting=false;showLocalInfo("Network not ready",networkPreflight());
         }
     }
     if (!wifiScanning) return;
@@ -166,13 +215,7 @@ void chooseWifi() {
     const auto& choice = wifiChoices[wifiSelected];
     editingSsid = choice.ssid;
     if (choice.open) {
-        preferences.putString("ssid", editingSsid);
-        preferences.putString("password", "");
-        WiFi.begin(editingSsid.c_str());
-        wifiConnecting = true; wifiConnectStarted = millis();
-        notice = "Connecting to " + editingSsid;
-        localPage = LocalPage::Wifi;
-        dirty = true;
+        startWifiJoin(editingSsid,"");
     } else openEditor(local::EditTarget::Password, "", 63);
 }
 
@@ -251,7 +294,7 @@ void chooseBackupAction() {
         showLocalInfo("Export backup", "Join FM1-Flip Wi-Fi and open 192.168.4.1 > Files to export " + backupLabel(backup) + ".");
 #endif
     } else if (!transportCanDeleteBackup(backup.path)) {
-        notice = "The active / last verified backup is protected";
+        notice = "Backup unavailable or operation in progress";
         dirty = true;
     } else armLocalConfirmation(LocalConfirmation::DeleteBackup, backup.path);
 }
@@ -271,13 +314,12 @@ void completeLocalConfirmation() {
     } else if (localConfirmation == LocalConfirmation::DeleteBackup) {
         String path = localConfirmationPath;
         if (path.startsWith("/fm1/backups/") && path.endsWith(".bin") && safePath(path) &&
-            transportCanDeleteBackup(path) && disk->remove(path)) {
-            disk->remove(path.substring(0, path.length() - 4) + ".json");
+            transportDeleteBackup(path)) {
             localConfirmation = LocalConfirmation::None;
             localReview = false;
             openBackups();
-            notice = "Older backup deleted";
-        } else notice = "Backup is protected or unavailable";
+            notice = "Backup deleted";
+        } else notice = "Backup unavailable or operation in progress";
     }
     localConfirmation = LocalConfirmation::None;
     localReview = false;
@@ -286,6 +328,7 @@ void completeLocalConfirmation() {
 }
 
 void showHome() {
+    networkPrompt=false;networkWaiting=false;pendingNetworkJob=Job{};
     if (wifiConnecting) { WiFi.disconnect(false); wifiConnecting = false; }
     confirmInstall = false;
     pendingAction.cancel();
@@ -305,6 +348,7 @@ void showHome() {
 }
 
 void backLocal() {
+    if(networkPrompt||networkWaiting){showHome();return;}
     if (confirmInstall) { confirmInstall = false; pendingAction.cancel(); }
     else if (wifiConnecting) { WiFi.disconnect(false); wifiConnecting = false; localPage = LocalPage::Wifi; }
     else if (localConfirmation != LocalConfirmation::None) { localConfirmation = LocalConfirmation::None; localReview = false; }
@@ -333,11 +377,13 @@ void openActionMenu(bool contextual = false) {
     homeMenu = false;
     actionIndex = 0;
     int index = selectedIndex();
-    if (index >= 0) actionIndex = readEntry(index).path.isEmpty() ? 5 : 6;
+    if (index >= 0) actionIndex = readEntry(index).path.isEmpty() ? 4 : 5;
     dirty = true;
 }
 
 void moveLocal(int direction) {
+    if(networkPrompt){networkPromptIndex=(networkPromptIndex+1)%2;dirty=true;return;}
+    if(networkWaiting)return;
     if (wifiConnecting) return;
     if (confirmInstall || localConfirmation != LocalConfirmation::None) return;
     if (searchPicker) { textEditor.moveCharacter(direction); dirty = true; return; }
@@ -347,6 +393,7 @@ void moveLocal(int direction) {
     if (actionMenu) step(actionIndex, LOCAL_ACTION_COUNT);
     else if (localPage == LocalPage::Wifi) step(wifiSelected, wifiChoices.size() + 1);
     else if (localPage == LocalPage::Backups) step(backupSelected, backupChoices.size());
+    else if (localPage == LocalPage::WebUi) step(hotspotSelected,3);
     else if (localPage == LocalPage::BackupActions) step(backupAction, 3);
     else if (localPage == LocalPage::History) step(historySelected, historyChoices.size());
     else if (localPage == LocalPage::Info) {
@@ -366,6 +413,8 @@ void moveLocal(int direction) {
 }
 
 void activateLocal() {
+    if(networkPrompt){chooseNetworkPrompt();return;}
+    if(networkWaiting){backLocal();return;}
     if (wifiConnecting) { backLocal(); return; }
     if (confirmInstall || localConfirmation != LocalConfirmation::None) return;
     if (searchPicker) {
@@ -374,6 +423,11 @@ void activateLocal() {
         else if (result == local::EditorResult::Cancelled) backLocal();
     }
     else if (actionMenu) { if (homeMenu) homeIndex = actionIndex; chooseAction(); }
+    else if (localPage == LocalPage::WebUi) {
+        if(hotspotSelected==0){if(!setWifiPower(!wifiEnabled))showLocalInfo("Wi-Fi error","Could not change Wi-Fi power.");else {localPage=LocalPage::WebUi;dirty=true;}return;}
+        if(hotspotSelected==1 && !setHotspot(!apEnabled))showLocalInfo("Hotspot error","Could not change the access point. Retry after the current network operation.");
+        else showLocalInfo("Web UI",webAccessDetails());
+    }
     else if (localPage == LocalPage::Wifi) chooseWifi();
     else if (localPage == LocalPage::Backups && !backupChoices.empty()) {
         localPage = LocalPage::BackupActions;
@@ -397,23 +451,24 @@ String actionSubtitle(size_t index) {
     switch (index) {
     case 0: return "Browse firmware from the Hub";
     case 1: return "Packages saved on this device";
-    case 2: return "FM-1 identity, separate from downloads";
-    case 3: return query.isEmpty() ? "Name, maker, tags or description" : query;
-    case 4: return "Pin or unpin the selected firmware";
-    case 5: return "Save a package for offline use";
-    case 6: return "No backup saved; Create backup is optional";
-    case 7: return "Identify the connected FM-1";
-    case 8: return "Read and verify the full flash";
-    case 9: return "Restore or manage stored backups";
-    case 10: return WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Scan networks and enter a password";
-    case 11: return "Cached locally; at most once a day";
-    case 12: return categoryFilter;
-    case 13: return releaseFilter == "stable" ? "Not marked beta" : releaseFilter;
-    case 14: return compatibilityFilter + " / maker declaration";
-    case 15: return sortOrder == "popular" ? "Most downloaded on the Hub" : sortOrder;
-    case 16: return favoritesOnly ? "Showing favorites" : "Showing all entries";
-    case 17: return storageReady ? readableBytes(freeSpace()) + " free" : "Initialize storage explicitly";
+    case 2: return query.isEmpty() ? "Name, maker, tags or description" : query;
+    case 3: return "Pin or unpin the selected firmware";
+    case 4: return "Save a package for offline use";
+    case 5: return "No backup saved; Create backup is optional";
+    case 6: return "Identify the connected FM-1";
+    case 7: return "Read and verify the full flash";
+    case 8: return "Restore or manage stored backups";
+    case 9: return WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Scan networks and enter a password";
+    case 10: return "Cached locally; at most once a day";
+    case 11: return categoryFilter;
+    case 12: return releaseFilter == "stable" ? "Not marked beta" : releaseFilter;
+    case 13: return compatibilityFilter + " / maker declaration";
+    case 14: return sortOrder == "popular" ? "Most downloaded on the Hub" : sortOrder;
+    case 15: return favoritesOnly ? "Showing favorites" : "Showing all entries";
+    case 16: return storageReady ? readableBytes(freeSpace()) + " free" : "Initialize storage explicitly";
+    case 17: return apEnabled ? "Hotspot ON / browser access" : "Hotspot OFF / enable when needed";
     case 18: return "Detailed result of the last operation";
+    case 19: return "FM-1 identity, separate from downloads";
     default: return "Return to Home";
     }
 }
@@ -430,18 +485,25 @@ void appendWindow(ui::Frame& frame, const std::vector<ui::Row>& rows, size_t cur
 
 ui::Frame buildLocalFrame(const TransportStatus& transport) {
     ui::Frame frame;
+    frame.wifiConnected=wifiEnabled && WiFi.status()==WL_CONNECTED;
     frame.connected = transport.mode != TransportMode::Disconnected;
     frame.right = transport.mode == TransportMode::Rom ? "USB ROM" : transport.firmwareLive ? "USB LIVE" : "OFFLINE";
 #ifdef FM1_CARDPUTER
-    const char* browseHint = ";/. Move  Enter Open  Fn+F Menu";
-    const char* menuHint = ";/. Move  Enter Choose  Fn+` Back";
-    const char* confirmHint = "Hold Enter 2s  Fn+` Cancel";
+    const char* browseHint = ";/. Move / Open , Back Fn+F Home";
+    const char* menuHint = ";/. Move  / Choose Esc/, Back";
+    const char* confirmHint = "Hold Enter or / 2s  Esc/, Cancel";
 #else
     const char* browseHint = "A Choose B Next Hold A Back";
     const char* menuHint = "A Choose B Next Hold A Back";
     const char* confirmHint = "Hold B 2s  Hold A Cancel";
 #endif
     frame.footer = browseHint;
+    if(networkPrompt){
+        frame.screen=ui::Screen::Menu;frame.title="Wi-Fi is off";frame.heading="Connect and continue?";
+        std::vector<ui::Row> rows={{"Connect Wi-Fi","Continue the download / refresh","",false},{"Cancel","Keep the radio off","",false}};
+        appendWindow(frame,rows,networkPromptIndex);frame.footer=menuHint;return frame;
+    }
+    if(networkWaiting&&!wifiConnecting){frame.screen=ui::Screen::Progress;frame.title="Preparing download";frame.heading="Waiting for network";frame.body="Waiting for the IP address and clock synchronization.";frame.footer="Back cancels";return frame;}
     if (confirmInstall || localConfirmation != LocalConfirmation::None) {
         frame.screen = ui::Screen::Confirm;
         frame.warning = true;
@@ -460,8 +522,8 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
             frame.heading = "Initialize storage?";
             frame.body = "Erases the internal filesystem, including any saved packages. Release, then hold to initialize.";
         } else {
-            frame.heading = "Delete older backup?";
-            frame.body = "Permanently removes this backup and its metadata. Export it first if needed.";
+            frame.heading = "Delete backup?";
+            frame.body = "Permanently removes this backup, even if it is your last copy. Export it first if needed.";
         }
         return frame;
     }
@@ -486,15 +548,19 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
             frame.total = jobTotal;
             xSemaphoreGive(jobMutex);
         }
-        frame.footer = transportCanCancel() ? "Hold A / Fn+` Cancel before writes" : "Please wait - do not disconnect";
+        #ifdef FM1_CARDPUTER
+        frame.footer = (transportCanCancel() || jobBusy.load()) ? "Esc/, Cancel; keep USB connected" : "Please wait - do not disconnect";
+#else
+        frame.footer = (transportCanCancel() || jobBusy.load()) ? "Hold A Cancel; keep USB connected" : "Please wait - do not disconnect";
+#endif
         return frame;
     }
     if (wifiConnecting) {
         frame.screen = ui::Screen::Progress; frame.busy = true;
         frame.title = "Joining Wi-Fi"; frame.eyebrow = standard(editingSsid);
         frame.heading = "Connecting to network";
-        frame.body = "The local access point stays available. Check signal and password if this takes a while.";
-        frame.footer = "A / Enter Cancel; Hold A Back";
+        frame.body = "Waiting for authentication and an IP address (up to 30 seconds).";
+        frame.footer = "Back cancels joining";
         return frame;
     }
     if (searchPicker) {
@@ -508,8 +574,8 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
         frame.editorGroup = textEditor.groupLabel();
 #ifdef FM1_CARDPUTER
         frame.editorGroup = "keyboard";
-        frame.body = "Backspace deletes. Fn+` cancels.";
-        frame.footer = textEditor.target() == local::EditTarget::Password ? "Type  Backspace Delete  Enter Join" : "Type  Backspace Delete  Enter Save";
+        frame.body = "Backspace deletes. Esc cancels.";
+        frame.footer = textEditor.target() == local::EditTarget::Password ? "Tab Show/Hide  Enter Join" : "Type  Backspace Delete  Enter Save";
 #else
         frame.body = "Hold B: previous. Choose OK to save; DEL to erase.";
         frame.footer = textEditor.target() == local::EditTarget::Password ? "A Add B Next Hold A Back" : "A Add B Next Hold A Back";
@@ -528,6 +594,12 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
         frame.footer = menuHint;
         return frame;
     }
+    if (localPage == LocalPage::WebUi) {
+        frame.screen=ui::Screen::Menu;frame.title="Web UI / hotspot";
+        frame.eyebrow=!wifiEnabled?"WI-FI RADIO OFF":apEnabled?"FM1-FLIP HOTSPOT ON":"HOTSPOT OFF";
+        std::vector<ui::Row> rows={{wifiEnabled?"Turn Wi-Fi off":"Turn Wi-Fi on","Radio power / saved setting","",false},{apEnabled?"Turn hotspot off":"Turn hotspot on","Saved across restarts","",false},{"Browser access details","Addresses and hotspot password","",false}};
+        appendWindow(frame,rows,hotspotSelected);frame.footer=menuHint;return frame;
+    }
     if (localPage == LocalPage::Wifi) {
         frame.screen = ui::Screen::Networks;
         frame.title = "Wi-Fi";
@@ -536,7 +608,7 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
         for (const auto& choice : wifiChoices) rows.push_back({standard(choice.ssid), choice.open ? "Open network" : "Password required", std::to_string(choice.rssi), false});
         rows.push_back({"Enter SSID manually", "For hidden networks", "", false});
         if (!wifiScanning) appendWindow(frame, rows, wifiSelected);
-        else { frame.heading = "Looking for networks"; frame.body = "The local access point stays available."; }
+        else { frame.heading = "Looking for networks"; frame.body = "Looking for nearby 2.4 GHz networks."; }
         frame.footer = menuHint;
         return frame;
     }
@@ -560,7 +632,7 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
         bool deletable = transportCanDeleteBackup(backup.path);
         std::vector<ui::Row> rows = {{"Restore on FM-1", "Physical hold before writing", "", false},
             {"Export information", "Keep a copy outside this device", "", false},
-            {"Delete older backup", deletable ? "Removes file and metadata" : "Active / last verified backup", deletable ? "" : "LOCK", false}};
+            {"Delete backup", deletable ? "Permanent; export first if needed" : "Unavailable / operation in progress", deletable ? "" : "LOCK", false}};
         appendWindow(frame, rows, backupAction);
         frame.footer = menuHint;
         return frame;
@@ -630,7 +702,7 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
             frame.body = standard(entry.description.substring(detailOffset, detailOffset + 180));
         }
         #ifdef FM1_CARDPUTER
-        frame.footer = ";/. Scroll Enter Options Fn+` Back";
+        frame.footer = ";/. Scroll / Options Esc/, Back";
 #else
         frame.footer = "A Options  B Scroll Hold A Back";
 #endif
@@ -685,8 +757,8 @@ void paintLocalTick() {
     if (signature != previousStatus) { previousStatus = signature; dirty = true; }
     bool busy = transport.busy || jobBusy.load();
     if (wasBusy && !busy) {
-        if (wasImport && importStage == "Import failed") showLocalInfo("Import failed", importDetail);
-        else if (!wasImport && transport.stage == "Error") showLocalInfo("Could not finish", transport.detail);
+        if (wasImport && (importStage == "Import failed" || importStage == "Import cancelled")) showLocalInfo(importStage, importDetail);
+        else if (!wasImport && (transport.stage == "Error" || transport.stage == "Cancelled")) showLocalInfo(transport.stage == "Cancelled" ? "Cancelled" : "Could not finish", transport.detail);
         else if (wasImport) notice = importStage == "Catalogue unchanged" ? "Catalogue already current" : job.catalogue ? "Catalogue updated" : "Package saved and checked";
         else notice = transport.stage;
     }
@@ -694,7 +766,6 @@ void paintLocalTick() {
     wasBusy = busy;
     int wifi = WiFi.status();
     if (wifi != previousWifi) {
-        if (previousWifi != -100 && wifi == WL_CONNECTED) notice = "Wi-Fi connected";
         previousWifi = wifi;
         dirty = true;
     }
@@ -741,7 +812,7 @@ void beginLocalDisplay() {
     boot.title = "FM-1 Flip";
     boot.eyebrow = "HOME";
     boot.heading = "Opening your library";
-    boot.body = "Mounting storage safely. No automatic formatting.";
+    boot.body = "Loading your firmware library.";
     boot.footer = "One moment...";
     ui::render(boot, screenCanvas);
 }

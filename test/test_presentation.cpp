@@ -145,6 +145,12 @@ int main(int argc, char** argv) {
     PhysicalDisplay display;
     OffscreenBuffer buffer{display, 0, 1, {}};
     BufferedCanvas<OffscreenBuffer> canvas(buffer, true);
+    Frame wifiStatus;wifiStatus.title="Home";
+    RepaintGate wifiGate;
+    assert(renderIfChanged(wifiStatus,canvas,wifiGate,1));
+    wifiStatus.wifiConnected=true;
+    assert(renderIfChanged(wifiStatus,canvas,wifiGate,20));
+    assert(!renderIfChanged(wifiStatus,canvas,wifiGate,40));
     Frame errorTitle;
     errorTitle.screen = Screen::Info;
     errorTitle.title = "Could not finish";
@@ -220,6 +226,16 @@ int main(int argc, char** argv) {
     input.begin(device::local::EditTarget::Password, "", 128);
     for (char c = 32; c <= 126; ++c) assert(input.type(c));
     assert(input.value().size() == 95 && input.displayedValue() == std::string(95, '*'));
+    input.togglePasswordVisibility();
+    assert(input.displayedValue()==input.value());
+    input.togglePasswordVisibility();
+    assert(input.displayedValue()==std::string(95,'*'));
+    input.begin(device::local::EditTarget::Password,"aB!",63);
+    input.moveCharacter(-1);assert(input.characterLabel()=="SHOW");
+    input.choose();assert(input.characterLabel()=="HIDE"&&input.displayedValue()=="aB!");
+    input.choose();assert(input.displayedValue()=="***"&&input.value()=="aB!");
+    input.togglePasswordVisibility();input.begin(device::local::EditTarget::Password,"aB!",63);
+    assert(input.displayedValue()=="***");
     device::local::TextEditor picker;
     picker.begin(device::local::EditTarget::Password, "", 128);
     for (int group = 0; group < 4; ++group) {

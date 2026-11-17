@@ -61,11 +61,14 @@ public:
     EditorResult choose();
     const std::string& value() const { return value_; }
     EditTarget target() const { return target_; }
+    void togglePasswordVisibility() { if (target_ == EditTarget::Password) passwordVisible_ = !passwordVisible_; }
     std::string displayedValue() const;
     std::string characterLabel() const;
     const char* groupLabel() const;
     size_t limit() const { return limit_; }
 private:
+    bool passwordVisible_ = false;
+    size_t actionCount() const { return target_ == EditTarget::Password ? 5 : 4; }
     EditTarget target_ = EditTarget::Search;
     std::string value_;
     size_t limit_ = 48, group_ = 0, character_ = 0;

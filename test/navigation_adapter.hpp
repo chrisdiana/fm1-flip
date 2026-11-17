@@ -12,3 +12,5 @@ struct {void disconnect(bool){}}WiFi;
 int selectedIndex(){return 0;}
 struct Entry{String path="saved.fwsc";};
 Entry readEntry(int){return {};}
+
+bool networkPrompt=false,networkWaiting=false;struct Job{};Job pendingNetworkJob;

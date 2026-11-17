@@ -39,3 +39,19 @@ subprocess.run([sys.executable, 'tools/check_local_search.py'], cwd=root, check=
 for board in ('sticks3', 'cardputer'):
     if next((pathlib.Path.home()/'.platformio/packages').glob('framework-espidf*/components/usb/enum.c'), None):
         subprocess.run([sys.executable, 'tools/check_usb_descriptor_limit.py', '--env', board], cwd=root, check=True)
+
+subprocess.run([sys.executable, "tools/check_download.py"], cwd=root, check=True)
+
+subprocess.run([sys.executable, "tools/check_backup_delete.py"], cwd=root, check=True)
+
+subprocess.run([sys.executable, "tools/check_display_startup.py"], cwd=root, check=True)
+
+subprocess.run([sys.executable, "tools/check_wifi_join.py"], cwd=root, check=True)
+
+subprocess.run([sys.executable, "tools/check_network_diagnostics.py"], cwd=root, check=True)
+
+subprocess.run([sys.executable, "tools/check_tls_memory.py"], cwd=root, check=True)
+
+subprocess.run([sys.executable, "tools/check_metadata_download.py"], cwd=root, check=True)
+
+subprocess.run([sys.executable, "tools/check_network_queue.py"], cwd=root, check=True)

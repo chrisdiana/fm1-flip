@@ -24,7 +24,7 @@ uint64_t fingerprint(const Frame& frame) {
         add(row.title); add(row.subtitle); add(row.badge); add(row.selected ? "1" : "0");
     }
     add(std::to_string(frame.completed)); add(std::to_string(frame.total));
-    add(frame.busy ? "1" : "0"); add(frame.warning ? "1" : "0"); add(frame.connected ? "1" : "0");
+    add(frame.busy ? "1" : "0"); add(frame.warning ? "1" : "0"); add(frame.connected ? "1" : "0"); add(frame.wifiConnected ? "1" : "0");
     return hash;
 }
 
@@ -83,9 +83,11 @@ void render(const Frame& frame, Canvas& canvas) {
     // Keep diagnostic titles readable: use normal size before truncating.
     const int titleScale = canvas.textWidth(frame.title, 2) <= width - 78 ? 2 : 1;
     canvas.text(10, 11, fit(frame.title, canvas, width - 78, titleScale), Color::Text, titleScale);
+    const int wifiSpace=frame.wifiConnected?14:0;
+    if(frame.wifiConnected)for(int i=0;i<3;++i)canvas.rect(width-18+i*4,23-(i+1)*3,2,(i+1)*3,Color::Success);
     if (!frame.right.empty()) {
-        std::string right = fit(frame.right, canvas, 62);
-        canvas.text(width - canvas.textWidth(right) - 9, 15, right,
+        std::string right = fit(frame.right, canvas, 62-wifiSpace);
+        canvas.text(width - canvas.textWidth(right) - 9-wifiSpace, 15, right,
                     frame.connected ? Color::Accent : Color::Muted);
     }
     if (!frame.eyebrow.empty()) canvas.text(11, 31, fit(frame.eyebrow, canvas, width - 22), Color::Muted);

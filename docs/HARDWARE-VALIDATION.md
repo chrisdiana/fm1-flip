@@ -1,6 +1,6 @@
 # Hardware validation still required
 
-StickS3 has been flashed and its display observed by the user. The user reported a dark FM-1 screen and failed connection with the earlier transport. The latest connection/install changes have host regression coverage but still need actual USB/power/backup/install validation. Successful compilation alone is not hardware validation.
+User-confirmed observations: StickS3 boot/UI and connection to an FM-1 running Patchwerk over direct USB-C; Cardputer ADV Launcher boot/UI, Wi-Fi and some firmware downloads. These observations do not validate FM-1 writes/restores or cancellation during writes. The latest Wi-Fi power and SD short-write changes need a device retry, and the firmware-specific SD failure is not yet confirmed resolved. Original Cardputer and StickS3 Launcher installation remain unverified.
 
 ## Before connecting
 

@@ -22,11 +22,12 @@ uint32_t crc32Update(uint32_t crc, const uint8_t* bytes, size_t length) {
   return ~crc;
 }
 
-bool crcReader(Reader& reader, uint32_t& crc) {
+bool crcReader(Reader& reader, uint32_t& crc, WriteCancel cancel, void* context) {
   uint8_t buffer[512];
   crc = 0;
   for (uint32_t offset = 0; offset < reader.size();) {
     const size_t count = size_t(std::min<uint64_t>(sizeof buffer, reader.size() - offset));
+    if (cancel && cancel(context)) return false;
     if (!reader.read(offset, buffer, count)) return false;
     crc = crc32Update(crc, buffer, count);
     offset += uint32_t(count);
@@ -34,10 +35,11 @@ bool crcReader(Reader& reader, uint32_t& crc) {
   return true;
 }
 
-bool crcFlash(Flash& flash, uint32_t& crc) {
+bool crcFlash(Flash& flash, uint32_t& crc, WriteCancel cancel, void* context) {
   uint8_t buffer[512];
   crc = 0;
   for (uint32_t offset = 0; offset < flash.size(); offset += sizeof buffer) {
+    if (cancel && cancel(context)) return false;
     if (!flash.read(offset, buffer, sizeof buffer)) return false;
     crc = crc32Update(crc, buffer, sizeof buffer);
   }
@@ -51,7 +53,8 @@ WriteReport fail(WriteError error, uint32_t address = 0, PackageError packageErr
 
 static WriteReport writePackageImpl(Flash& flash, Reader& packageReader, DeviceModel target,
                                     Reader* verifiedBackup, uint32_t expectedBackupCrc,
-                                    WriteProgress progress, void* context) {
+                                    WriteProgress progress, void* context, WriteCancel cancel) {
+  if (cancel && cancel(context)) return fail(WriteError::Cancelled);
   if (flash.size() != kFlashBytes) return fail(WriteError::InvalidFlash);
   if (verifiedBackup && verifiedBackup->size() != kFlashBytes) return fail(WriteError::InvalidBackup);
 
@@ -64,9 +67,9 @@ static WriteReport writePackageImpl(Flash& flash, Reader& packageReader, DeviceM
 
   if (verifiedBackup) {
     uint32_t backupCrc = 0, currentCrc = 0;
-    if (!crcReader(*verifiedBackup, backupCrc)) return fail(WriteError::ReadFailure);
+    if (!crcReader(*verifiedBackup, backupCrc, cancel, context)) return fail(cancel && cancel(context) ? WriteError::Cancelled : WriteError::ReadFailure);
     if (backupCrc != expectedBackupCrc) return fail(WriteError::BackupMismatch);
-    if (!crcFlash(flash, currentCrc)) return fail(WriteError::ReadFailure);
+    if (!crcFlash(flash, currentCrc, cancel, context)) return fail(cancel && cancel(context) ? WriteError::Cancelled : WriteError::ReadFailure);
     if (currentCrc != expectedBackupCrc) return fail(WriteError::BackupMismatch);
   }
 
@@ -87,6 +90,7 @@ static WriteReport writePackageImpl(Flash& flash, Reader& packageReader, DeviceM
   // erase. Each write still reads its sector before erasing, so a later I/O
   // failure cannot erase that sector without having a complete replacement.
   for (uint32_t address = kFirstWritable; address < end; address += kSectorBytes) {
+    if (cancel && cancel(context)) return fail(WriteError::Cancelled, address);
     if (!writableSector(address, kSectorBytes)) return fail(WriteError::UnsafeSector, address);
     const size_t count = std::min<uint32_t>(kSectorBytes, end - address);
     if (readFlashImage(packageReader, packageInfo, address, source, count) != PackageError::None)
@@ -95,7 +99,9 @@ static WriteReport writePackageImpl(Flash& flash, Reader& packageReader, DeviceM
   }
 
   uint32_t changed = 0;
+  auto stopped = [&](uint32_t address) { return WriteReport{WriteError::Cancelled, PackageError::None, address, changed}; };
   for (uint32_t address = kFirstWritable; address < end; address += kSectorBytes) {
+    if (cancel && cancel(context)) return stopped(address);
     const size_t count = std::min<uint32_t>(kSectorBytes, end - address);
     if (!flash.read(address, current, sizeof current)) return fail(WriteError::ReadFailure, address);
     memcpy(desired, current, sizeof desired);
@@ -103,6 +109,7 @@ static WriteReport writePackageImpl(Flash& flash, Reader& packageReader, DeviceM
       return fail(WriteError::ReadFailure, address);
     if (memcmp(current, desired, sizeof current) != 0) {
       if (!writableSector(address, kSectorBytes)) return fail(WriteError::UnsafeSector, address);
+      if (cancel && cancel(context)) return stopped(address);
       if (!flash.eraseSector(address)) return fail(WriteError::EraseFailure, address);
       if (!flash.program(address, desired, sizeof desired)) return fail(WriteError::ProgramFailure, address);
       if (!flash.read(address, current, sizeof current)) return fail(WriteError::ReadFailure, address);
@@ -113,6 +120,7 @@ static WriteReport writePackageImpl(Flash& flash, Reader& packageReader, DeviceM
                            address, context);
   }
 
+  if (cancel && cancel(context)) return stopped(end);
   // Check every boot/calibration sector against its pre-write snapshot.
   size_t protectedIndex = 0;
   for (uint32_t address = 0; address < kFlashBytes; address += kSectorBytes) {
@@ -130,27 +138,28 @@ static WriteReport writePackageImpl(Flash& flash, Reader& packageReader, DeviceM
 
 WriteReport writePackage(Flash& flash, Reader& packageReader, DeviceModel target,
                          Reader& verifiedBackup, uint32_t expectedBackupCrc,
-                         WriteProgress progress, void* context) {
-  return writePackageImpl(flash, packageReader, target, &verifiedBackup, expectedBackupCrc, progress, context);
+                         WriteProgress progress, void* context, WriteCancel cancel) {
+  return writePackageImpl(flash, packageReader, target, &verifiedBackup, expectedBackupCrc, progress, context, cancel);
 }
 
 WriteReport writePackageWithoutBackup(Flash& flash, Reader& packageReader, DeviceModel target,
-                                     WriteProgress progress, void* context) {
-  return writePackageImpl(flash, packageReader, target, nullptr, 0, progress, context);
+                                     WriteProgress progress, void* context, WriteCancel cancel) {
+  return writePackageImpl(flash, packageReader, target, nullptr, 0, progress, context, cancel);
 }
 
 WriteReport restoreBackup(Flash& flash, Reader& desiredBackup, Reader& currentVerifiedBackup,
                           uint32_t desiredCrc, uint32_t currentCrc,
-                          WriteProgress progress, void* context) {
+                          WriteProgress progress, void* context, WriteCancel cancel) {
+  if (cancel && cancel(context)) return fail(WriteError::Cancelled);
   if (flash.size() != kFlashBytes) return fail(WriteError::InvalidFlash);
   if (desiredBackup.size() != kFlashBytes || currentVerifiedBackup.size() != kFlashBytes)
     return fail(WriteError::InvalidBackup);
   uint32_t actual = 0;
-  if (!crcReader(desiredBackup, actual)) return fail(WriteError::ReadFailure);
+  if (!crcReader(desiredBackup, actual, cancel, context)) return fail(cancel && cancel(context) ? WriteError::Cancelled : WriteError::ReadFailure);
   if (actual != desiredCrc) return fail(WriteError::BackupMismatch);
-  if (!crcReader(currentVerifiedBackup, actual)) return fail(WriteError::ReadFailure);
+  if (!crcReader(currentVerifiedBackup, actual, cancel, context)) return fail(cancel && cancel(context) ? WriteError::Cancelled : WriteError::ReadFailure);
   if (actual != currentCrc) return fail(WriteError::BackupMismatch);
-  if (!crcFlash(flash, actual)) return fail(WriteError::ReadFailure);
+  if (!crcFlash(flash, actual, cancel, context)) return fail(cancel && cancel(context) ? WriteError::Cancelled : WriteError::ReadFailure);
   if (actual != currentCrc) return fail(WriteError::BackupMismatch);
 
   uint8_t current[kSectorBytes], desired[kSectorBytes];
@@ -165,13 +174,16 @@ WriteReport restoreBackup(Flash& flash, Reader& desiredBackup, Reader& currentVe
       return fail(WriteError::ProtectedRegionMismatch, address);
   }
   uint32_t changed = 0;
+  auto stopped = [&](uint32_t address) { return WriteReport{WriteError::Cancelled, PackageError::None, address, changed}; };
   const uint32_t total = kLastWritable - kFirstWritable;
   for (uint32_t address = kFirstWritable; address < kLastWritable; address += kSectorBytes) {
+    if (cancel && cancel(context)) return stopped(address);
     // Obtain a complete replacement before erasing this sector.
     if (!desiredBackup.read(address, desired, sizeof desired) ||
         !flash.read(address, current, sizeof current))
       return {WriteError::ReadFailure, PackageError::None, address, changed};
     if (memcmp(current, desired, sizeof current)) {
+      if (cancel && cancel(context)) return stopped(address);
       if (!flash.eraseSector(address))
         return {WriteError::EraseFailure, PackageError::None, address, changed};
       if (!flash.program(address, desired, sizeof desired))
@@ -184,6 +196,7 @@ WriteReport restoreBackup(Flash& flash, Reader& desiredBackup, Reader& currentVe
     }
     if (progress) progress(address + kSectorBytes - kFirstWritable, total, address, context);
   }
+  if (cancel && cancel(context)) return stopped(kLastWritable);
   // Also detect an adapter/device fault which changes a protected sector.
   for (uint32_t address = 0; address < kFlashBytes; address += kSectorBytes) {
     if (writableSector(address, kSectorBytes)) continue;
@@ -199,6 +212,7 @@ WriteReport restoreBackup(Flash& flash, Reader& desiredBackup, Reader& currentVe
 const char* errorMessage(WriteError error) {
   switch (error) {
     case WriteError::None: return "write verified";
+    case WriteError::Cancelled: return "write cancelled after completing the current sector";
     case WriteError::InvalidPackage: return "package validation failed";
     case WriteError::WrongDevice: return "package is for a different device";
     case WriteError::InvalidFlash: return "target flash size is unsupported";

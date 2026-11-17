@@ -35,7 +35,7 @@ constexpr size_t MaxDeviceRecordBytes=24576;
 constexpr size_t MaxHistoryEntries=16;
 String logPath;
 String lastLoggedStage;
-// 0 idle, 1 cancellation allowed, 2 cancellation accepted, 3 write committed.
+// 0 idle, 1 preflight, 2 stop requested, 3 writing (sector-boundary stop), 4 rebooting.
 std::atomic<uint8_t> cancellation{0};
 std::atomic<bool> baselineExists{false};
 constexpr uint32_t FlashSize = 0x100000;
@@ -337,11 +337,14 @@ class RomFlash final : public fm1::Flash {
  bool eraseSector(uint32_t address)override{return fm1::writableSector(address,4096)&&jl::erase(address,4096,error,sizeof error);}
  bool program(uint32_t address,const uint8_t* source,size_t count)override{return fm1::writableSector(address,count)&&jl::program(address,source,count,error,sizeof error);}
 };
+bool writeCancelled(void*) {return cancellation.load()==2;}
 void writeProgress(uint32_t completed,uint32_t total,uint32_t,void*) {
  update("Installing / verifying","Keep power connected; changed sectors read back",completed,total);
  vTaskDelay(1);
 }
 bool restartAndConfirm(const String& expected,String& error) {
+ uint8_t expectedPhase=3;
+ if(!cancellation.compare_exchange_strong(expectedPhase,4)){error="Cancelled; FM-1 remains in loader mode. Reinstall or restore before restarting.";return false;}
  char err[160]{};
  bool acknowledged=jl::restart(err,sizeof err);
  identifiedFm1=false;
@@ -394,7 +397,8 @@ bool installDevice(const char* path,String& error) {
  if(packageHash(file)!=hash){error="Package changed before installation; no writes performed";return false;}
  if(!commitWrite(error))return false;
  update("Preflight","Checking live sectors and protected regions; no backup file will be saved");
- auto report=fm1::writePackageWithoutBackup(flash,reader,fm1::DeviceModel::Fm1,writeProgress);
+ auto report=fm1::writePackageWithoutBackup(flash,reader,fm1::DeviceModel::Fm1,writeProgress,nullptr,writeCancelled);
+ if(report.error==fm1::WriteError::Cancelled){error="Install cancelled. FM-1 remains in loader mode; reinstall or restore before restarting.";return false;}
  if(report.error!=fm1::WriteError::None) {
   error=String(fm1::errorMessage(report.error))+" at "+String(report.address,HEX)+"; "+flash.error+". Restart withheld.";
   return false;
@@ -435,7 +439,8 @@ bool restoreDevice(const char* path,String& error) {
  if(!current){error="Fresh backup unavailable";return false;}
  PackageReader desiredReader(desired),currentReader(current);RomFlash flash;
  if(!commitWrite(error))return false;
- auto report=fm1::restoreBackup(flash,desiredReader,currentReader,desiredCrc,backupCrc,writeProgress);
+ auto report=fm1::restoreBackup(flash,desiredReader,currentReader,desiredCrc,backupCrc,writeProgress,nullptr,writeCancelled);
+ if(report.error==fm1::WriteError::Cancelled){error="Restore cancelled. Backups retained; reinstall or restore before restarting FM-1.";return false;}
  if(report.error!=fm1::WriteError::None) {error=String(fm1::errorMessage(report.error))+"; "+flash.error+". Backups retained; restart withheld.";return false;}
  desired.close();current.close();
  if(!restartAndConfirm(expectedFirmware,error))return false;
@@ -459,7 +464,7 @@ void worker(void*) {
    else if(cmd.kind==2) {ok=identifiedFm1 && host::connected();if(!ok)ok=connectDevice(error);if(ok)ok=backupDevice(error);}
    else if(cmd.kind==3) ok=installDevice(cmd.path,error);
    else if(cmd.kind==4) ok=restoreDevice(cmd.path,error);
-   if(!ok) update("Error",error);
+   if(!ok) update(cancellation.load()==2?"Cancelled":"Error",error);
    cancellation.store(0);
    xSemaphoreTake(lock,portMAX_DELAY);
    state.busy=false;state.connected=identifiedFm1 && host::connected();
@@ -526,33 +531,28 @@ bool transportConnect(){return submit(1);}
 bool transportBackup(){return submit(2);}
 bool transportInstall(const String& path){return submit(3,path);}
 bool transportRestore(const String& path){return submit(4,path);}
-bool transportCanCancel(){return cancellation.load()==1;}
-bool transportCancel(){uint8_t expected=1;return cancellation.compare_exchange_strong(expected,2);}
+bool transportCanCancel(){const auto phase=cancellation.load();return phase==1||phase==3;}
+bool transportCancel(){
+ uint8_t phase=cancellation.load();
+ while(phase==1||phase==3){if(cancellation.compare_exchange_weak(phase,2))return true;}
+ return phase==2;
+}
 uint64_t transportBackupReserve(){return 65536;} // Working space only; manual backups use actual free storage.
 uint32_t transportFlashId(){const auto snapshot=transportStatus();return snapshot.connected?snapshot.flashId:0;}
 bool transportCanDeleteBackup(const String& path) {
- const auto snapshot=transportStatus();
- if(snapshot.busy || path==snapshot.lastBackupPath || !path.startsWith("/fm1/backups/backup-") || !path.endsWith(".bin") || path.indexOf("..")>=0) return false;
+ if(transportStatus().busy || !path.startsWith("/fm1/backups/backup-") || !path.endsWith(".bin") || path.indexOf("..")>=0) return false;
  String number=path.substring(strlen("/fm1/backups/backup-"),path.length()-4);
  if(number.isEmpty())return false;
  for(auto c:number)if(!isdigit((unsigned char)c))return false;
- uint32_t requested=number.toInt(),first=UINT32_MAX,last=0;
- File directory=disk->open("/fm1/backups");
- if(!directory)return false;
- for(File file=directory.openNextFile();file;file=directory.openNextFile()) {
-  if(file.isDirectory() || file.size()!=FlashSize)continue;
-  String name=file.name();name=name.substring(name.lastIndexOf('/')+1);
-  if(!name.startsWith("backup-") || !name.endsWith(".bin"))continue;
-  String n=name.substring(7,name.length()-4);bool digits=n.length()>0;
-  for(auto c:n)digits=digits&&isdigit((unsigned char)c);
-  if(!digits)continue;
-  String metadataPath="/fm1/backups/"+name.substring(0,name.length()-4)+".json";
-  File metadata=disk->open(metadataPath);JsonDocument record;
-  if(!metadata || metadata.size()>4096 || deserializeJson(record,metadata) || record["verified"]!=true || record["model"]!="FM-1")continue;
-  uint32_t index=n.toInt();first=std::min(first,index);last=std::max(last,index);
- }
- // Keep the original baseline and most recent verified backup, even after an
- // M5 restart. Older intermediate backups can be explicitly exported/deleted.
- return first!=UINT32_MAX && requested!=first && requested!=last;
+ File file=disk->open(path);
+ return file && !file.isDirectory();
+}
+bool transportDeleteBackup(const String& path) {
+ if(!transportCanDeleteBackup(path) || !disk->remove(path))return false;
+ disk->remove(path.substring(0,path.length()-4)+".json");
+ xSemaphoreTake(lock,portMAX_DELAY);
+ if(state.lastBackupPath==path){state.lastBackupPath="";state.backupVerified=false;}
+ xSemaphoreGive(lock);
+ return true;
 }
 }

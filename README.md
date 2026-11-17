@@ -2,22 +2,22 @@
 
 A portable M-VAVE FM-1 firmware manager for **M5Stack StickS3, Cardputer ADV, and original Cardputer**. Browse firmware, download packages, install them on an FM-1, and optionally save backups without a computer. A local web interface is also available.
 
-Development firmware: StickS3 uploads, basic UI operation and connection to an FM-1 running Patchwerk have been observed. FM-1 backup, install and restore flows, both Cardputer variants, and physical M5Launcher installation still need hardware validation. See [hardware validation](docs/HARDWARE-VALIDATION.md) for the cable/power checks.
+Development firmware: StickS3 uploads, basic UI operation and connection to an FM-1 running Patchwerk have been observed. The user has also observed Cardputer ADV boot/UI, Wi-Fi and some firmware downloads through M5Launcher. FM-1 backup/install/restore and mid-write cancellation still need hardware validation, as do original Cardputer and StickS3 installation through Launcher. See [hardware validation](docs/HARDWARE-VALIDATION.md) for the cable/power checks.
 
 ## Install with M5Launcher
 
 Get precompiled binaries from [GitHub Releases](https://github.com/chrisdiana/fm1-flip/releases).
 
-Use the matching file in `build/releases/m5launcher/`:
+Use the matching file in `build/releases/`:
 
 | Board | M5Launcher binary |
 | --- | --- |
-| StickS3 | `fm1-flip-sticks3-m5launcher.bin` |
-| Cardputer / Cardputer ADV | `fm1-flip-cardputer-m5launcher.bin` |
+| StickS3 | `fm1-flip-sticks3.bin` |
+| Cardputer / Cardputer ADV | `fm1-flip-cardputer.bin` |
 
-Copy the file to SD and choose **SD → file → Install**, or upload through Launcher's **WUI**. StickS3 uses a merged image so Launcher can create its internal data partition; initialize storage through **Home → Storage & export** on first use if it does not mount. Cardputer uses an app-only image and a FAT32 microSD card. These packages target current dynamic-partition Launcher builds and still need physical Launcher installation testing.
+Copy the file to SD and choose **SD → file → Install**, or upload through Launcher's **WUI**. StickS3 uses a merged image so Launcher can create its internal data partition; initialize storage through **Home → Storage & export** on first use if it does not mount. Cardputer also uses a merged image and keeps its files on a FAT32 microSD card. Both release images can be flashed directly at address `0x0` for standalone use; this replaces Launcher. These packages target current dynamic-partition Launcher builds and still need physical Launcher installation testing.
 
-See [M5Launcher installation and packaging](docs/M5LAUNCHER.md) for exact setup, storage behavior and checksums. `python3 tools/package_launcher.py` creates the two files and `build/releases/fm1-flip-m5launcher.zip` from fresh builds. This packaging command never reads or flashes a device.
+See [M5Launcher installation and packaging](docs/M5LAUNCHER.md) for exact setup, storage behavior and checksums. `python3 tools/package_launcher.py` creates exactly these two binaries plus a manifest and checksums from fresh builds. This packaging command never reads or flashes a device.
 
 ## Quick start
 
@@ -49,7 +49,7 @@ A hold starts after **0.5 seconds**. Held-B scrolling repeats every **300 ms in 
 | **Hold A** | Cancel the confirmation |
 | **A+B** | Cancel the confirmation and go Home |
 
-During a transport operation, **hold A** requests cancellation while the screen says cancellation is available. Once flash writing begins, cancellation is disabled. **A+B** selects Home as the return view; progress remains visible until the operation finishes.
+During a transport operation, **hold A** requests cancellation while the screen says cancellation is available. During flash writing it finishes and verifies the current sector, then stops without restarting FM-1. A partial installation must be completed or restored before restarting the FM-1. **A+B** selects Home as the return view; progress remains visible until the operation finishes.
 
 ### How Back works
 
@@ -80,15 +80,15 @@ These controls apply to Cardputer ADV and original Cardputer.
 | --- | --- |
 | **`;`** | Previous item / scroll up |
 | **`.`** | Next item / scroll down |
-| **Enter** | Choose/open the highlighted item |
-| **Fn + backtick** | Back one level; cancel text entry or a pending confirmation |
+| **Enter** or **`/`** | Choose/open the highlighted item (slash types normally in text entry) |
+| **Esc** or **`,`** | Back one level; cancel a pending confirmation or active operation (comma types normally in text entry) |
 | **Fn + F** | Go Home during normal navigation |
 | **Tab** | Cycle Discover → Downloaded → Loaded on FM-1 while browsing |
 | **Type printable text** | Search the firmware list while browsing |
 | **Backspace/Delete** | Remove the last search character |
-| **Hold Enter for 2 seconds** | Confirm a reviewed install, restore, initialization or deletion |
+| **Hold Enter or `/` for 2 seconds** | Confirm a reviewed install, restore, initialization or deletion |
 
-**Backtick** is the grave-accent key. During a transport operation, **Fn + backtick** requests cancellation only before the write gate closes. During text entry, type the value directly, use Backspace/Delete to edit, **Enter** to submit, and **Fn + backtick** to cancel. Use the cancel key before Home if you are in the editor or reviewing a confirmation.
+The top-left **Esc / backtick** key goes Back. During a transport operation, **Esc** requests cancellation during connection, backups, imports and flash writing. Writes stop after completing and verifying the current sector; the FM-1 is not restarted after cancellation. During text entry, type the value directly, use Backspace/Delete to edit, **Enter** to submit, and **Esc** to cancel. Use the cancel key before Home if you are in the editor or reviewing a confirmation.
 
 Additional shortcuts in firmware browsing/detail views:
 
@@ -106,7 +106,6 @@ Additional shortcuts in firmware browsing/detail views:
 | --- | --- |
 | **Discover** | Browse cached Firmware Hub listings, sorted by popularity by default |
 | **Downloaded** | Browse packages actually saved on the M5, including retained older releases |
-| **Loaded on FM-1** | See live or last-observed firmware identity; choose to open confirmed installation history |
 | **Search** | Enter a search across names, makers, descriptions and tags |
 | **Favorite / unfavorite** | Pin or unpin the selected firmware |
 | **Download package** | Save the selected maker package for offline installation |
@@ -119,15 +118,17 @@ Additional shortcuts in firmware browsing/detail views:
 | **Category / Release channel / Chip support** | Cycle catalogue filters |
 | **Sort** | Cycle popularity, name and newest release |
 | **Favorites only** | Toggle favorite filtering |
-| **Storage & export** | See free space, storage setup and web export instructions |
+| **Storage & export** | See free space and storage setup |
+| **Web UI / hotspot** | Toggle Wi-Fi radio power or hotspot broadcast and view browser addresses/password |
 | **Last operation** | Read the last transport/import result or error |
+| **Loaded on FM-1** | See live or last-observed firmware identity; choose to open confirmed installation history |
 | **Home** | Return to Home |
 
 Search and filters can remain active when switching between Discover and Downloaded. Clear Search, set filters to **all**, and turn **Favorites only** off if an expected entry is missing. Popul-arity uses Hub install counts; it is not a hardware compatibility guarantee.
 
 ### Download and install
 
-A catalogue listing is not a downloaded package. Open its firmware options and choose **Download package** first. The app downloads from the maker's release and checks package structure and supplied hashes. External-installer-only listings cannot be downloaded by the app. Older downloaded releases remain separately selectable after a catalogue update.
+A catalogue listing is not a downloaded package. Open its firmware options and choose **Download package** first. The app downloads from the maker's release and checks package structure and supplied hashes. External-installer-only listings cannot be downloaded by the app. Older downloaded releases remain separately selectable after a catalogue update. Downloads support responses without a declared length, including chunked HTTP responses, and are capped at 4 MB. Storage keeps 64 KB of working space; no full-backup space is reserved.
 
 Downloaded packages can be installed offline. Installation still requires a recognized FM-1, valid package/hash/chip metadata, and physical confirmation. Unknown compatibility is refused. The writer preserves boot/calibration ranges, writes changed application sectors and checks readback. A reported MIDI boot identity is a further check; inspect actual FM-1 operation after restart.
 
@@ -137,11 +138,11 @@ Choose **Home → Create backup** to save a complete **1 MiB** FM-1 image, check
 
 To restore, first use **Connect FM-1** to identify the target, then choose **Backups → selected backup → Restore on FM-1** and physically confirm. Restoration creates a fresh rollback backup and needs additional free space. It preserves boot/calibration sectors and refuses an image with mismatched protected bytes or device identity. It is not a bootloader replacement tool.
 
-Backup actions also provide export instructions and deletion of eligible older backups. The original baseline, latest verified backup and active/armed backup remain protected from deletion. Use the web file view or power down before removing a Cardputer SD card to copy files.
+Backup actions also provide export instructions and explicit deletion of any saved backup, including the original or last copy. Select **Delete backup**, then hold B on StickS3 or Enter on Cardputer for two seconds to confirm. Deletion is blocked while an operation or restore confirmation is active. Use the web file view or power down before removing a Cardputer SD card to copy files.
 
 ## Optional web interface
 
-On the M5, open **Storage & export** for access details. Connect your phone/computer to the **FM1-Flip** access point using its displayed password, then open **http://192.168.4.1/**. The access point remains available when the M5 also joins your home Wi-Fi.
+Open **Home → Web UI / hotspot**. The hotspot defaults **off**; turn it on when needed, then open **Browser access details** for the password and **http://192.168.4.1/**. Turning it off stops broadcasting FM1-Flip and does not disconnect home Wi-Fi. The setting is saved across restarts. If already on home Wi-Fi, use the station address shown in Browser access details instead. The browser Settings page also has the hotspot toggle.
 
 | Web tab | Contents |
 | --- | --- |
@@ -178,12 +179,12 @@ pio run -e cardputer -e sticks3
 python3 tools/check.py
 # Optional real-browser frontend check with a local fixture API:
 python3 tools/check_web.py
-python3 tools/package_release.py sticks3 cardputer
+python3 tools/package_launcher.py
 ```
 
 On this host, the PlatformIO executable is `~/.platformio/penv/bin/pio` if `pio` is not on PATH.
 
-Pinned dependencies and partition layouts are in `platformio.ini` and `partitions/`. Factory binaries and SHA-256 manifest are generated in `build/releases/`; factory images are merged for offset `0x0`. App-only `.pio/build/<board>/firmware.bin` images belong at the application partition offset `0x10000`. No command above uploads to hardware. USB download-mode and M5Launcher installation must be checked on the actual board before use.
+Pinned dependencies and partition layouts are in `platformio.ini` and `partitions/`. The same two merged release binaries and SHA-256 manifest are generated in `build/releases/`; both images are merged for offset `0x0`. App-only `.pio/build/<board>/firmware.bin` images belong at the application partition offset `0x10000`. No command above uploads to hardware. USB download-mode and M5Launcher installation must be checked on the actual board before use.
 
 The StickS3 uses a single 3 MiB application partition and a 4.9375 MiB LittleFS partition, with no OTA app slot. Packages share that filesystem with catalogue data and backups. Cardputer stores these files on a FAT32 microSD card. Imports leave 64 KiB of working space. Firmware installs do not automatically create or require a backup. Choose **Create backup** on Home to retain a verified 1 MiB image when wanted; existing backups remain stored and consume actual space. Backup restoration still creates its fresh rollback backup. Full storage causes operations to refuse or fail rather than deleting saved backups.
 
@@ -206,3 +207,14 @@ Import the JSON through the web page or copy it to `/fm1/catalogue.json` on SD. 
 - [Dependencies and upstream provenance](docs/DEPENDENCIES.md)
 
 Project code is GPL-3.0-only; imported MIT and other third-party components retain their licenses. See `LICENSE` and `third_party/cardputer-synth-rescue/THIRD-PARTY.md`. Firmware list: [The Firmware Hub](https://thefirmwarehub.com/), CC BY 4.0 compilation; maker descriptions/images remain their makers' work. The local catalogue normalizes and bounds metadata for embedded use, and links to the maker sources.
+
+
+In the on-device Wi-Fi password editor, press **Tab** on Cardputer to show/hide the password. On StickS3, select **SHOW / HIDE** in the character picker's edit actions. Passwords start hidden each time the editor opens. The browser's Wi-Fi form also has a **Show password** button.
+
+
+Wi-Fi setup uses 2.4 GHz networks. After entering credentials, a small green connection indicator appears in the header when connected; successful joins do not show a popup. Failures still show authentication/network/timeout guidance. Browser addresses are under Web UI / hotspot. HTTPS imports require a working Internet connection and a synchronized clock. Connection failures now include TLS errors and free/largest-block RAM diagnostics so they can be distinguished from FM-1 USB hardware failures.
+
+
+Use **Home → Web UI / hotspot → Turn Wi-Fi off** to shut down the radio (both home-network Wi-Fi and hotspot) for lower power use. The power setting is saved. Choosing Download or Refresh while it is off asks **Connect Wi-Fi and continue?**. Confirm to reconnect with saved credentials, wait for an IP/clock, and continue automatically; Cancel keeps Wi-Fi off. Hotspot broadcast remains a separate saved preference. The browser also has a Wi-Fi power toggle; switching off closes the connection.
+
+Downloads write in SD-sector-sized pieces and complete positive partial writes. A zero-progress storage write still aborts the import and removes the partial file; its error includes byte offset and filesystem errno instead of guessing that it is a network problem.

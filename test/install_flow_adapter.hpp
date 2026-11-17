@@ -3,6 +3,7 @@
 #include <cassert>
 bool packageValid=true,backupOk=true,packagePresent=true;
 String metadataSupport="new";
+bool cancelDuringWrite=false;
 constexpr uint32_t FlashSize=0x100000;
 uint32_t backupCrc=1;
 String backupPath="/fm1/backups/backup-1.bin";
@@ -28,13 +29,13 @@ Disk* disk=&fakeDisk;
 struct PackageReader {explicit PackageReader(File&){};};
 struct RomFlash {String error;};
 namespace fm1 {
-enum class DeviceModel{Fm1};enum class PackageError{None,Invalid};enum class WriteError{None};
+enum class DeviceModel{Fm1};enum class PackageError{None,Invalid};enum class WriteError{None,Cancelled};
 struct PackageInfo {String product="Fixture";uint32_t flashSize=FlashSize;};
 struct WriteReport {WriteError error=WriteError::None;uint32_t address=0,changedSectors=1;};
 PackageError validatePackage(PackageReader&,DeviceModel,PackageInfo&){events.push_back("validate");return packageValid?PackageError::None:PackageError::Invalid;}
 const char* errorMessage(PackageError){return "Invalid package";}
 const char* errorMessage(WriteError){return "Write error";}
-WriteReport writePackageWithoutBackup(RomFlash&,PackageReader&,DeviceModel,void(*)(uint32_t,uint32_t,uint32_t,void*)) {events.push_back("write");return {};}
+WriteReport writePackageWithoutBackup(RomFlash&,PackageReader&,DeviceModel,void(*)(uint32_t,uint32_t,uint32_t,void*),void*,bool(*)(void*)) {events.push_back("write");if(cancelDuringWrite){cancellation.store(2);return {WriteError::Cancelled,0,1};}return {};}
 }
 String packageHash(File&){events.push_back("hash");return fixtureHash;}
 String scanCatalogue(File&,std::function<void(uint32_t,JsonObject)>){return "";}
@@ -43,3 +44,5 @@ bool commitWrite(String&){events.push_back("commit");return true;}
 void writeProgress(uint32_t,uint32_t,uint32_t,void*){}
 bool restartAndConfirm(const String&,String&){events.push_back("restart");return true;}
 void recordSuccessfulOperation(const String&,const String&,const String&){events.push_back("record");}
+
+bool writeCancelled(void*){return cancellation.load()==2;}

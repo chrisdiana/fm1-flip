@@ -7,7 +7,7 @@ source=(root/'src/device/local_app.inc').read_text()
 app=(root/'src/device/app.cpp').read_text()
 enums=source[source.index('enum class LocalPage'):source.index('struct WifiChoice')]
 functions=source[source.index('void setMainTab('):source.index('void openEditor(')]
-functions+=source[source.index('void showHome('):source.index('void moveLocal(')]
+functions+=source[source.index('void showHome() {'):source.index('void moveLocal(')]
 functions=functions.replace('.isEmpty()', '.empty()')
 startup=next(line for line in app.splitlines() if line.startswith('bool actionMenu='))
 with tempfile.TemporaryDirectory(prefix='fm1-navigation-') as name:

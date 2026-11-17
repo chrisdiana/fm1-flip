@@ -1,18 +1,21 @@
 #include "device/catalogue.h"
 #include "device/catalogue_seed.h"
 #include "device/trust.h"
+#include "device/network_diagnostics.h"
+#include "device/download_stream.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <time.h>
 #include <regex.h>
+#include <cerrno>
 namespace device { namespace {
 constexpr char HUB[]="https://thefirmwarehub.com/catalog.json";
 constexpr char AGENT[]="FM1-Flip/0.1 (portable FM-1 firmware manager; The Firmware Hub client)";
 constexpr uint32_t RAW_LIMIT=1024*1024;
 String clip(String value,size_t n){if(value.length()>n)value.remove(n);return value;}
-String caBundle(fs::FS& fs){File f=fs.open("/fm1/ca.pem");if(f&&f.size()<=32768)return f.readString();return FM1_TRUST_ROOTS;}
+String caBundle(fs::FS& fs){File f=fs.open("/fm1/ca.pem");if(f&&f.size()<=32768)return f.readString();return String();}
 bool validRepo(const String& repo){int slash=repo.indexOf('/');if(slash<=0||slash==(int)repo.length()-1||repo.indexOf('/',slash+1)>=0)return false;for(auto c:repo)if(!isalnum((unsigned char)c)&&c!='_'&&c!='-'&&c!='.'&&c!='/')return false;return repo.indexOf("..")<0;}
 String encode(const String& s){String out;char b[4];for(auto c:s){if(isalnum((unsigned char)c)||c=='-'||c=='_'||c=='.'||c=='~')out+=c;else{snprintf(b,sizeof(b),"%%%02X",(unsigned char)c);out+=b;}}return out;}
 String decode(const String& s){String out;for(size_t i=0;i<s.length();i++){if(s[i]=='%'&&i+2<s.length()&&isxdigit(s[i+1])&&isxdigit(s[i+2])){char v[3]={s[i+1],s[i+2],0};out+=(char)strtoul(v,nullptr,16);i+=2;}else out+=s[i];}return out;}
@@ -74,10 +77,23 @@ String normalize(File& in,File& out,const ScratchSpace& space){
  out.printf("],\"sourceEntryCount\":%u,\"omittedEntries\":%u}",(unsigned)total,(unsigned)(total-count));return out.getWriteError()?"Catalogue write failed":String();
 }
 String get(fs::FS& fs,const String& url,const String& path,uint32_t limit,NetworkProgress progress,Preferences* cache=nullptr,bool conditional=true,ScratchSpace space=ScratchSpace()){
- String ca=caBundle(fs);WiFiClientSecure client;client.setCACert(ca.c_str());HTTPClient http;http.setConnectTimeout(5000);http.setTimeout(5000);http.setUserAgent(AGENT);http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);if(!http.begin(client,url))return "Cannot initialize HTTPS";
+ String ready=networkPreflight();if(!ready.isEmpty())return ready;
+ String ca=caBundle(fs);WiFiClientSecure client;client.setCACert(ca.isEmpty()?FM1_TRUST_ROOTS:ca.c_str());HTTPClient http;http.setConnectTimeout(15000);http.setTimeout(15000);client.setHandshakeTimeout(15);http.setUserAgent(AGENT);http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);if(!http.begin(client,url))return "Cannot initialize HTTPS";
  const char* headers[]={"ETag","Last-Modified"};http.collectHeaders(headers,2);http.addHeader("Accept","application/json");http.addHeader("Accept-Encoding","identity");if(cache&&conditional){String etag=cache->getString("etag"),modified=cache->getString("modified");if(etag.length())http.addHeader("If-None-Match",etag);if(modified.length())http.addHeader("If-Modified-Since",modified);}
- int code=http.GET();if(code==304){http.end();return "NOT_MODIFIED";}if(code!=200){http.end();return "HTTPS request failed: "+String(code);}int expected=http.getSize();if(expected<0||uint32_t(expected)>limit||(space&&uint64_t(expected)>space())){http.end();return "Missing or oversized response length";}File out=fs.open(path,FILE_WRITE);if(!out){http.end();return "Cannot create pending response";}uint8_t buffer[1536];uint32_t count=0,last=millis();String error;
- while(count<uint32_t(expected)){int ready=http.getStreamPtr()->available();if(ready>0){size_t want=std::min<size_t>(sizeof(buffer),std::min<size_t>(ready,uint32_t(expected)-count));int got=http.getStreamPtr()->readBytes(buffer,want);if(got<=0||out.write(buffer,got)!=(size_t)got){error="Read or storage failure";break;}count+=got;last=millis();progress("Catalogue/network",url,count,expected);}else if(!http.connected()||millis()-last>10000){error="Interrupted response";break;}vTaskDelay(1);}
+ int code=http.GET();if(code==304){http.end();return "NOT_MODIFIED";}if(code!=200){String error=httpsFailure(code,client,url);http.end();return error;}int expected=http.getSize();
+ if(expected>=0&&uint32_t(expected)>limit){http.end();return "Metadata response exceeds size limit";}
+ if(expected>=0&&space&&uint64_t(expected)>space()){http.end();return "Insufficient metadata scratch space";}
+ File out=fs.open(path,FILE_WRITE);if(!out){http.end();return "Cannot create pending response";}
+ int writeErrno=0;
+ DownloadStream sink(limit,0,[&]()->uint64_t{return space?space():UINT64_MAX;},
+  [&](const uint8_t* data,size_t size){errno=0;auto wrote=out.write(data,size);if(wrote<size)writeErrno=errno;return wrote;},
+  [](const uint8_t*,size_t){},
+  [&](size_t count){if(progress)progress("Catalogue/network",url,count,expected>0?expected:0);vTaskDelay(1);},
+  {},"Metadata response exceeds size limit");
+ // Decode chunk framing through HTTPClient instead of reading its raw socket.
+ int received=http.writeToStream(&sink);String error;
+ if(!sink.error.empty()){error=sink.error.c_str();if(sink.error=="Download storage write failed")error+=" at byte "+String((unsigned long)sink.bytesWritten())+", errno "+String(writeErrno)+" ("+(writeErrno?String(strerror(writeErrno)):String("driver supplied no error code"))+")";}
+ else if(received<0||(expected>=0&&received!=expected))error="Interrupted metadata response";
  out.close();if(error.isEmpty()&&cache){cache->putString("nextEtag",clip(http.header("ETag"),256));cache->putString("nextModified",clip(http.header("Last-Modified"),128));}http.end();if(!error.isEmpty())fs.remove(path);return error;
 }
 } // namespace

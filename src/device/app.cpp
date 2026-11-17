@@ -12,6 +12,8 @@
 #include "device/library_http.h"
 #include "fm1/package.hpp"
 #include "fm1/confirmation.hpp"
+#include "device/download_stream.h"
+#include "device/network_diagnostics.h"
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <SD.h>
@@ -23,6 +25,7 @@
 #include <Preferences.h>
 #include <mbedtls/sha256.h>
 #include <atomic>
+#include <cerrno>
 #ifdef FM1_CARDPUTER
 #include <M5Cardputer.h>
 #undef DISPLAY
@@ -40,6 +43,10 @@ struct EntryIndex { uint32_t offset=0; String localPath;gallery::SortKey sort; }
 EntryIndex entryIndex[MAX_ENTRIES]; size_t entryCount=0;JsonDocument favorites;uint32_t favoriteGeneration=0;
 fs::FS* disk=nullptr; bool storageReady=false; WebServer server(80); Preferences preferences;
 String catalogueSource="https://thefirmwarehub.com/catalog.json",catalogueAttribution="The Firmware Hub",catalogueLicense="CC-BY-4.0";
+bool wifiEnabled=false, webConfigured=false;int pendingWifiPower=-1;
+bool apEnabled=false;int pendingHotspot=-1;uint32_t hotspotChangeAt=0;
+std::atomic<uint16_t> wifiDisconnectReason{0};
+String wifiResult="Not connected";
 String retrievedAt,query,notice="Hardware validation pending",apPassword;
 fm1::PendingAction pendingAction;
 String categoryFilter="all",releaseFilter="all",compatibilityFilter="all",sortOrder="popular";
@@ -47,9 +54,10 @@ String categories[24];size_t categoryCount=0;
 bool savedOnly=false,favoritesOnly=false,detail=false,confirmInstall=false,dirty=true;
 bool actionMenu=true,searchPicker=false,exportActive=false;size_t actionIndex=0,characterIndex=0,detailOffset=0;
 File exportFile;WiFiClient exportClient;uint32_t exportLast=0;
-size_t selected=0; uint32_t lastPaint=0; std::atomic<bool> jobBusy(false),reload(false);
+size_t selected=0; uint32_t lastPaint=0; std::atomic<bool> jobBusy(false),reload(false),jobCancel(false);
 SemaphoreHandle_t jobMutex; String jobStage="Idle",jobDetail; uint32_t jobCompleted=0,jobTotal=0;std::atomic<uint32_t> workerStack(0);
 struct Job { String url,hash,path; bool download; bool catalogue=false,refresh=false; String id,metadata; }; Job job;
+Job pendingNetworkJob;bool networkPrompt=false,networkWaiting=false;size_t networkPromptIndex=0;uint32_t networkReadyStarted=0;
 File upload; String uploadError; bool uploadOwned=false,uploadTrust=false; uint32_t uploadBytes=0;
 uint64_t freeSpace(){
  if(!storageReady)return 0;
@@ -60,7 +68,9 @@ uint64_t freeSpace(){
 #endif
 }
 extern bool localReview;
-bool locked(){return localReview||pendingAction.active()||jobBusy.load()||exportActive||transportStatus().busy;}
+extern bool wifiConnecting;
+bool locked(){return networkPrompt||networkWaiting||localReview||pendingAction.active()||jobBusy.load()||exportActive||transportStatus().busy;}
+bool cancelOperation(){if(jobBusy.load()&&!uploadOwned){jobCancel.store(true);return true;}return transportCancel();}
 String clipped(String v,size_t max){if(v.length()>max)v.remove(max);return v;}
 String fileId(const String& id){uint8_t hash[32];mbedtls_sha256((const uint8_t*)id.c_str(),id.length(),hash,0);String out;char hex[3];for(auto b:hash){snprintf(hex,sizeof(hex),"%02x",b);out+=hex;}return out;}
 String safeId(String v){String o;for(size_t i=0;i<v.length()&&o.length()<96;i++){char c=v[i];if(isalnum((unsigned char)c)||c=='-'||c=='_'||c=='.')o+=c;}return o;}
@@ -72,14 +82,15 @@ void finishWorker(){workerStack.store(uxTaskGetStackHighWaterMark(nullptr));jobB
 void networkJob(void*){
  String error; bool ok=true; const String pending=job.path+".part";
  if(job.refresh){error=refreshHub(*disk,pending,jobStatus,[]{return freeSpace()>reserveBytes()?freeSpace()-reserveBytes():0;});if(error=="NOT_MODIFIED"){jobStatus("Catalogue unchanged","Last valid cache retained");finishWorker();return;}ok=error.isEmpty();}
- if(job.download&&!job.id.isEmpty()){error=resolveMakerAsset(*disk,job.id,job.url,job.hash,job.metadata,jobStatus);ok=error.isEmpty();}
+ if(job.download){error=networkPreflight();ok=error.isEmpty();}
+ if(job.download&&ok&&!job.id.isEmpty()){error=resolveMakerAsset(*disk,job.id,job.url,job.hash,job.metadata,jobStatus);ok=error.isEmpty();}
+ if(jobCancel.load()){ok=false;error="Import cancelled";}
  if(job.download&&ok){
   File cert=disk->open("/fm1/ca.pem",FILE_READ);String ca;
   if(cert&&cert.size()<=32768)ca=cert.readString();
-  if(ca.isEmpty())ca=FM1_TRUST_ROOTS;
   WiFiClientSecure client;HTTPClient http;
-  if(ok&&WiFi.status()!=WL_CONNECTED){ok=false;error="Connect station Wi-Fi first";}
-  if(ok){client.setCACert(ca.c_str());http.setConnectTimeout(5000);http.setTimeout(5000);http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);if(!http.begin(client,job.url)){ok=false;error="Invalid HTTPS URL";}}
+  if(ok){error=networkPreflight();ok=error.isEmpty();}
+  if(ok){client.setCACert(ca.isEmpty()?FM1_TRUST_ROOTS:ca.c_str());http.setConnectTimeout(15000);http.setTimeout(15000);client.setHandshakeTimeout(15);http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);if(!http.begin(client,job.url)){ok=false;error="Invalid HTTPS URL";}}
   const char* redirectHeaders[]={"Location"};http.collectHeaders(redirectHeaders,1);http.setUserAgent("FM1-Flip/0.1");
   int code=ok?http.GET():0;String currentUrl=job.url;
   for(unsigned redirect=0;ok&&(code==301||code==302||code==303||code==307||code==308);redirect++){
@@ -87,25 +98,37 @@ void networkJob(void*){
    bool allowed=next.startsWith("https://")&&(host=="github.com"||host=="release-assets.githubusercontent.com"||host=="objects.githubusercontent.com"||host=="github-releases.githubusercontent.com");
    if(redirect>=5||!allowed){ok=false;error="Rejected non-HTTPS or non-maker/CDN redirect";break;}http.end();if(!http.begin(client,next)){ok=false;error="Invalid redirect";break;}http.collectHeaders(redirectHeaders,1);code=http.GET();currentUrl=next;
   }
-  if(ok&&code!=HTTP_CODE_OK){ok=false;error="HTTPS request failed: "+String(code);}
+  if(ok&&code!=HTTP_CODE_OK){ok=false;error=httpsFailure(code,client,currentUrl);}
   int expected=ok?http.getSize():0;
-  if(ok&&(expected<0||size_t(expected)>PACKAGE_LIMIT||uint64_t(expected)+reserveBytes()>freeSpace())){ok=false;error="Missing/oversized length or backup reserve unavailable";}
+  if(ok&&expected>int(PACKAGE_LIMIT)){ok=false;error="Package exceeds 4 MB download limit";}
+  if(ok&&expected>=0&&uint64_t(expected)+reserveBytes()>freeSpace()){ok=false;error="Not enough storage: need "+String((unsigned long)expected)+" bytes plus 64 KB working space; free "+String((unsigned long)freeSpace())+" bytes";}
   File out;if(ok){out=disk->open(pending,FILE_WRITE);if(!out){ok=false;error="Cannot create pending package";}}
   mbedtls_sha256_context sha;mbedtls_sha256_init(&sha);mbedtls_sha256_starts(&sha,0);
-  uint32_t count=0,lastData=millis();uint8_t buffer[2048];
-  while(ok&&count<(uint32_t)expected){int n=http.getStreamPtr()->available();if(n>0){size_t want=std::min<size_t>(sizeof(buffer),std::min<size_t>(n,(size_t)expected-(size_t)count));int got=http.getStreamPtr()->readBytes(buffer,want);if(got<=0||out.write(buffer,got)!=(size_t)got){ok=false;error="Download storage/read failure";break;}mbedtls_sha256_update(&sha,buffer,got);count+=got;lastData=millis();jobStatus("Downloading",job.path,count,expected);}else if(!http.connected()||millis()-lastData>10000){ok=false;error="Interrupted download";}vTaskDelay(1);}
+  if(ok){
+   int writeErrno=0;
+   DownloadStream sink(PACKAGE_LIMIT,reserveBytes(),freeSpace,
+    [&](const uint8_t* data,size_t size){errno=0;auto wrote=out.write(data,size);if(wrote<size)writeErrno=errno;return wrote;},
+    [&](const uint8_t* data,size_t size){mbedtls_sha256_update(&sha,data,size);},
+    [&](size_t count){jobStatus("Downloading",job.path,count,expected>0?expected:0);vTaskDelay(1);},[]{return jobCancel.load();});
+   // HTTPClient decodes chunk framing; raw getStreamPtr() does not.
+   int received=http.writeToStream(&sink);
+   if(!sink.error.empty()){ok=false;error=sink.error.c_str();if(sink.error=="Download storage write failed")error+=" at byte "+String((unsigned long)sink.bytesWritten())+", errno "+String(writeErrno)+" ("+(writeErrno?String(strerror(writeErrno)):String("driver supplied no error code"))+"), free storage "+String((unsigned long)freeSpace())+" bytes, heap "+String(ESP.getFreeHeap());}
+   else if(received<0||(expected>=0&&received!=expected)){ok=false;error="Download interrupted or incomplete";}
+  }
   uint8_t digest[32];mbedtls_sha256_finish(&sha,digest);mbedtls_sha256_free(&sha);if(out)out.close();http.end();
   String hash;char hex[3];for(auto b:digest){snprintf(hex,sizeof(hex),"%02x",b);hash+=hex;}
   if(ok&&!job.hash.isEmpty()&&!hash.equalsIgnoreCase(job.hash)){ok=false;error="Source SHA-256 mismatch";}
  }
+ if(jobCancel.load()){ok=false;error="Import cancelled";}
  if(ok){jobStatus("Validating","Checking import integrity");if(job.catalogue){File f=disk->open(pending);error=scanCatalogue(f);}else error=validate(pending);ok=error.isEmpty();}
+ if(jobCancel.load()){ok=false;error="Import cancelled";}
  if(ok){if(job.catalogue){String old=job.path+".old";disk->remove(old);bool hadOld=disk->exists(job.path);if(hadOld&&!disk->rename(job.path,old)){ok=false;error="Cannot preserve catalogue";}if(ok&&!disk->rename(pending,job.path)){if(hadOld)disk->rename(old,job.path);ok=false;error="Cannot commit catalogue";}if(ok){disk->remove(old);if(job.refresh)commitCatalogueCache();}}else if(disk->exists(job.path)||!disk->rename(pending,job.path)){ok=false;error="Cannot commit package (already saved?)";}}
  if(ok&&job.download&&!job.metadata.isEmpty()){File metadata=disk->open(job.path+".json.part",FILE_WRITE);if(metadata){metadata.print(job.metadata);metadata.close();disk->rename(job.path+".json.part",job.path+".json");}}
  if(!ok)disk->remove(pending);
- jobStatus(ok?"Imported":"Import failed",ok?"Package integrity checked; hardware compatibility remains unknown":error);
+ jobStatus(ok?"Imported":jobCancel.load()?"Import cancelled":"Import failed",ok?"Package integrity checked; hardware compatibility remains unknown":error);
  reload.store(true);finishWorker();
 }
-bool startJob(const Job& next){if(locked())return false;job=next;jobBusy.store(true);jobStatus("Queued",next.path);if(xTaskCreate(networkJob,"fm1-import",12288,nullptr,1,nullptr)!=pdPASS){jobBusy.store(false);jobStatus("Error","Cannot allocate import worker");return false;}return true;}
+bool startJob(const Job& next){if(locked())return false;job=next;jobCancel.store(false);jobBusy.store(true);jobStatus("Queued",next.path);if(xTaskCreate(networkJob,"fm1-import",12288,nullptr,1,nullptr)!=pdPASS){jobBusy.store(false);jobStatus("Error","Cannot allocate import worker");return false;}return true;}
 size_t matchCount();
 Entry readEntry(size_t index){
  Entry out;if(index>=entryCount)return out;auto& ref=entryIndex[index];
@@ -154,8 +177,35 @@ void sendJson(JsonDocument& doc){String s;serializeJson(doc,s);server.send(200,"
 void reject(int code,const String& message){server.send(code,"text/plain",message);}
 void onUpload(bool trust,bool catalogue=false){auto& u=server.upload();if(u.status==UPLOAD_FILE_START){uploadError="";uploadBytes=0;uploadOwned=false;uploadTrust=trust;if(!storageReady||locked()){uploadError="Storage unavailable or busy";return;}String name=u.filename;name=name.substring(name.lastIndexOf('/')+1);if(!trust&&!catalogue&&(!name.endsWith(".fwsc")||safeId(name)!=name||name.indexOf("..")>=0)){uploadError="Use a simple .fwsc filename";return;}String target=catalogue?"/fm1/catalogue.json":trust?"/fm1/ca.pem":"/fm1/packages/"+name;if(disk->exists(target)&&!trust&&!catalogue){uploadError="Package already exists";return;}job.path=target;job.download=false;job.catalogue=catalogue;job.refresh=false;job.id="";job.metadata="";job.url="";job.hash="";jobBusy.store(true);uploadOwned=true;upload=disk->open(target+".part",FILE_WRITE);if(!upload)uploadError="Cannot create upload";}
  else if(u.status==UPLOAD_FILE_WRITE&&uploadOwned&&uploadError.isEmpty()){
-  uploadBytes+=u.currentSize;uint32_t max=catalogue?CATALOGUE_LIMIT:trust?32768:PACKAGE_LIMIT;if(uploadBytes>max||freeSpace()<reserveBytes()+u.currentSize){uploadError="File too large or backup reserve reached";return;}if(upload.write(u.buf,u.currentSize)!=u.currentSize)uploadError="Storage write failure";
+  uploadBytes+=u.currentSize;uint32_t max=catalogue?CATALOGUE_LIMIT:trust?32768:PACKAGE_LIMIT;if(uploadBytes>max||freeSpace()<reserveBytes()+u.currentSize){uploadError="File too large or insufficient working space";return;}if(upload.write(u.buf,u.currentSize)!=u.currentSize)uploadError="Storage write failure";
  }else if((u.status==UPLOAD_FILE_END||u.status==UPLOAD_FILE_ABORTED)&&uploadOwned){upload.close();if(u.status==UPLOAD_FILE_ABORTED)uploadError="Upload interrupted";if(!uploadError.isEmpty()){disk->remove(job.path+".part");jobBusy.store(false);uploadOwned=false;return;}if(trust){File pem=disk->open(job.path+".part");String data=pem.readString();pem.close();if(data.indexOf("-----BEGIN CERTIFICATE-----")<0||!disk->rename(job.path+".part",job.path)){uploadError="Invalid certificate bundle or commit failed";disk->remove(job.path+".part");}jobBusy.store(false);}else{jobBusy.store(false);if(!startJob(job))uploadError="Cannot start validation";}uploadOwned=false;}
+}
+void startWifiJoin(const String& ssid,const String& password);
+bool setWifiPower(bool enabled,bool reconnect=true);
+bool requestNetworkJob(const Job& next);
+bool setHotspot(bool enabled) {
+ if(enabled&&!wifiEnabled&&!setWifiPower(true,false))return false;
+ bool ok=enabled?WiFi.softAP("FM1-Flip",apPassword.c_str()):WiFi.softAPdisconnect(true);
+ if(ok){apEnabled=enabled;preferences.putBool("apEnabled",enabled);}
+ return ok;
+}
+bool setWifiPower(bool enabled,bool reconnect) {
+ if(jobBusy.load()||transportStatus().busy)return false;
+ if(!enabled){
+  if(webConfigured)server.stop();
+  WiFi.disconnect(false);
+  if(!WiFi.mode(WIFI_OFF))return false;
+  wifiEnabled=false;apEnabled=false;wifiConnecting=false;wifiResult="Wi-Fi radio off";
+ }else{
+  if(!WiFi.mode(WIFI_STA))return false;
+  wifiEnabled=true;wifiResult="Wi-Fi on; not connected";
+  configTime(0,0,"pool.ntp.org","time.cloudflare.com");
+  if(preferences.getBool("apEnabled",false))setHotspot(true);
+  if(webConfigured)server.begin();
+  String ssid=preferences.getString("ssid","");
+  if(reconnect&&!ssid.isEmpty())startWifiJoin(ssid,preferences.getString("password",""));
+ }
+ preferences.putBool("wifiEnabled",enabled);dirty=true;return true;
 }
 void configureWeb(){
  server.on("/",HTTP_GET,[]{server.send_P(200,"text/html",WEB_INDEX);});
@@ -167,7 +217,7 @@ void configureWeb(){
   serveStoredPackages(server,*disk,"StickS3 internal storage");
 #endif
  });
- server.on("/api/status",HTTP_GET,[]{JsonDocument d;auto s=transportStatus();d["firmwareProduct"]=s.firmwareProduct;d["firmwareLive"]=s.firmwareLive;d["firmwareKnown"]=s.firmwareKnown;d["mode"]=transportModeName(s.mode);d["stage"]=s.stage;d["detail"]=s.detail;d["completed"]=s.completed;d["total"]=s.total;{xSemaphoreTake(jobMutex,portMAX_DELAY);d["importStage"]=jobStage;d["importDetail"]=jobDetail;if(jobBusy.load()){d["stage"]=jobStage;d["detail"]=jobDetail;d["completed"]=jobCompleted;d["total"]=jobTotal;}xSemaphoreGive(jobMutex);}if(pendingAction.active()){d["stage"]="Confirm on device";d["detail"]=pendingAction.snapshot().label;}d["confirmationPending"]=pendingAction.active();d["heapFree"]=ESP.getFreeHeap();d["heapMinimum"]=ESP.getMinFreeHeap();d["workerStackWatermark"]=workerStack.load();d["transportStackWatermark"]=transportStackWatermark();d["targetFlashId"]=transportFlashId();d["canCancel"]=transportCanCancel();d["busy"]=locked();d["storageReady"]=storageReady;d["free"]=freeSpace();d["backupReserve"]=reserveBytes();d["ap"]=WiFi.softAPIP().toString();d["station"]=WiFi.localIP().toString();sendJson(d);});
+ server.on("/api/status",HTTP_GET,[]{JsonDocument d;auto s=transportStatus();d["firmwareProduct"]=s.firmwareProduct;d["firmwareLive"]=s.firmwareLive;d["firmwareKnown"]=s.firmwareKnown;d["mode"]=transportModeName(s.mode);d["stage"]=s.stage;d["detail"]=s.detail;d["completed"]=s.completed;d["total"]=s.total;{xSemaphoreTake(jobMutex,portMAX_DELAY);d["importStage"]=jobStage;d["importDetail"]=jobDetail;if(jobBusy.load()){d["stage"]=jobStage;d["detail"]=jobDetail;d["completed"]=jobCompleted;d["total"]=jobTotal;}xSemaphoreGive(jobMutex);}if(pendingAction.active()){d["stage"]="Confirm on device";d["detail"]=pendingAction.snapshot().label;}d["confirmationPending"]=pendingAction.active();d["heapFree"]=ESP.getFreeHeap();d["heapMinimum"]=ESP.getMinFreeHeap();d["workerStackWatermark"]=workerStack.load();d["transportStackWatermark"]=transportStackWatermark();d["targetFlashId"]=transportFlashId();d["wifiEnabled"]=wifiEnabled;d["networkConfirmationPending"]=networkPrompt;d["apEnabled"]=apEnabled;d["wifiResult"]=wifiResult;d["wifiJoining"]=wifiConnecting;d["wifiDisconnectReason"]=wifiDisconnectReason.load();d["canCancel"]=transportCanCancel()||(jobBusy.load()&&!uploadOwned);d["busy"]=locked();d["storageReady"]=storageReady;d["free"]=freeSpace();d["backupReserve"]=reserveBytes();d["ap"]=WiFi.softAPIP().toString();d["station"]=WiFi.localIP().toString();sendJson(d);});
  server.on("/api/catalogue",HTTP_GET,[]{
  if(!storageReady||jobBusy.load()||transportStatus().busy)return reject(409,"Storage unavailable or catalogue busy");
  size_t result[MAX_ENTRIES],total=0,offset=std::max<long>(0,server.arg("offset").toInt());String q=server.arg("q");q.toLowerCase();String mode=server.arg("filter"),category=server.arg("category"),release=server.arg("release"),compatibility=server.arg("compatibility");if(category.isEmpty())category="all";if(release.isEmpty())release="all";if(compatibility.isEmpty())compatibility="all";bool onlySaved=server.arg("view")=="saved"||mode=="saved";uint32_t flash=transportFlashId();
@@ -176,55 +226,56 @@ void configureWeb(){
  for(size_t n=offset;n<total&&a.size()<16;n++){auto e=readEntry(result[n]);auto o=a.add<JsonObject>();o["id"]=e.id;o["name"]=e.name;o["author"]=e.author;o["description"]=e.description;o["version"]=e.version;o["hubUrl"]=e.hubUrl;o["sourceUrl"]=e.sourceUrl;o["projectUrl"]=e.projectUrl;o["releaseUrl"]=e.releaseUrl;o["license"]=e.license;o["downloadable"]=e.downloadable;o["size"]=e.size;o["saved"]=!e.path.isEmpty();o["favorite"]=e.favorite;o["tags"].to<JsonArray>().add(e.tags);o["chip"]=e.chip;o["beta"]=e.beta;o["date"]=e.date;o["compatibility"]=gallery::status(gallery::compatibility(e.chip.c_str(),flash));o["hardwareTested"]=false;o["artworkUrl"]=e.artworkUrl;if(e.popularityKnown)o["hubInstalls"]=e.popularity;else o["hubInstalls"]=nullptr;o["path"]=e.path;}
  d["total"]=total;d["offset"]=offset;d["limit"]=16;sendJson(d);});
  server.on("/api/favorite",HTTP_POST,[]{if(!storageReady||locked())return reject(409,"Storage busy");for(size_t i=0;i<entryCount;i++)if(readEntry(i).id==server.arg("id")){toggleFavorite(i);dirty=true;return reject(200,"Favorite updated");}reject(404,"Unknown entry");});
- server.on("/api/download",HTTP_POST,[]{if(!storageReady||locked())return reject(409,"Storage busy");for(size_t i=0;i<entryCount;i++)if(readEntry(i).id==server.arg("id")){auto e=readEntry(i);if(!e.downloadable||!e.path.isEmpty())return reject(400,"No supported maker package or already saved");String id=fileId(e.id+"|"+e.sha256);if(id.isEmpty())return reject(400,"Invalid package ID");Job next;next.path="/fm1/packages/"+id+".fwsc";next.download=true;next.id=e.id;if(startJob(next))return reject(202,"Maker download queued; inspect import status for validation result");return reject(503,"Worker unavailable");}reject(404,"Unknown entry");});
- server.on("/api/refresh",HTTP_POST,[]{if(!storageReady||locked())return reject(409,"Storage busy");if(WiFi.status()!=WL_CONNECTED)return reject(409,"Connect station Wi-Fi first");if(freeSpace()<reserveBytes()+64*1024)return reject(409,"Insufficient catalogue scratch and backup reserve");Job next;next.path="/fm1/catalogue.json";next.download=false;next.catalogue=true;next.refresh=true;if(startJob(next))return reject(202,"Catalogue refresh queued (at most once per day)");reject(503,"Worker unavailable");});
+ server.on("/api/download",HTTP_POST,[]{if(!storageReady||locked())return reject(409,"Storage busy");for(size_t i=0;i<entryCount;i++)if(readEntry(i).id==server.arg("id")){auto e=readEntry(i);if(!e.downloadable||!e.path.isEmpty())return reject(400,"No supported maker package or already saved");String id=fileId(e.id+"|"+e.sha256);if(id.isEmpty())return reject(400,"Invalid package ID");Job next;next.path="/fm1/packages/"+id+".fwsc";next.download=true;next.id=e.id;if(requestNetworkJob(next))return reject(202,"Maker download queued; inspect import status for validation result");return reject(503,"Worker unavailable");}reject(404,"Unknown entry");});
+ server.on("/api/refresh",HTTP_POST,[]{if(!storageReady||locked())return reject(409,"Storage busy");if(wifiEnabled&&WiFi.status()!=WL_CONNECTED)return reject(409,"Connect station Wi-Fi first");if(freeSpace()<reserveBytes()+64*1024)return reject(409,"Insufficient catalogue working space");Job next;next.path="/fm1/catalogue.json";next.download=false;next.catalogue=true;next.refresh=true;if(requestNetworkJob(next))return reject(202,"Catalogue refresh queued (at most once per day)");reject(503,"Worker unavailable");});
  server.on("/api/upload",HTTP_POST,[]{reject(uploadError.isEmpty()?202:400,uploadError.isEmpty()?"Upload received; inspect import status for validation result":uploadError);},[]{onUpload(false);});
  server.on("/api/catalogue-upload",HTTP_POST,[]{reject(uploadError.isEmpty()?202:400,uploadError.isEmpty()?"Catalogue queued for validation":uploadError);},[]{onUpload(false,true);});
  server.on("/api/trust",HTTP_POST,[]{reject(uploadError.isEmpty()?200:400,uploadError.isEmpty()?"CA bundle saved":uploadError);},[]{onUpload(true);});
- server.on("/api/wifi",HTTP_POST,[]{String ssid=server.arg("ssid"),pass=server.arg("password");if(ssid.isEmpty()||ssid.length()>32||pass.length()>63)return reject(400,"Invalid network credentials");preferences.putString("ssid",ssid);preferences.putString("password",pass);WiFi.begin(ssid.c_str(),pass.c_str());reject(202,"Connecting; access point remains available");});
+ server.on("/api/wifi",HTTP_POST,[]{String ssid=server.arg("ssid"),pass=server.arg("password");if(ssid.isEmpty()||ssid.length()>32||pass.length()>63)return reject(400,"Invalid network credentials");startWifiJoin(ssid,pass);reject(202,"Joining Wi-Fi; the result will appear on the device and in status");});
+ server.on("/api/wifi-power",HTTP_POST,[]{if(locked())return reject(409,"Operation in progress");String value=server.arg("enabled");if(value!="true"&&value!="false")return reject(400,"Use enabled=true or false");reject(202,value=="true"?"Turning Wi-Fi on":"Turning Wi-Fi radio off; browser connection will close");pendingWifiPower=value=="true"?1:0;hotspotChangeAt=millis()+300;if(pendingWifiPower==0)pendingHotspot=-1;});
+ server.on("/api/hotspot",HTTP_POST,[]{if(locked())return reject(409,"Operation in progress");String enabled=server.arg("enabled");if(enabled!="true"&&enabled!="false")return reject(400,"Use enabled=true or false");bool next=enabled=="true";reject(202,next?"Enabling hotspot":"Disabling hotspot; use the home-network address or on-device controls to reconnect");pendingHotspot=next?1:0;hotspotChangeAt=millis()+300;});
  server.on("/api/files",HTTP_GET,[]{if(!storageReady||locked())return reject(409,"Storage unavailable or busy");JsonDocument d;auto a=d.to<JsonArray>();for(auto dirName:{"/fm1/packages","/fm1/backups","/fm1/logs"}){File dir=disk->open(dirName);for(File f=dir.openNextFile();f&&a.size()<96;f=dir.openNextFile()){if(f.isDirectory())continue;String name=f.name();if(name.endsWith(".part"))continue;auto o=a.add<JsonObject>();o["path"]=String(dirName)+"/"+name.substring(name.lastIndexOf('/')+1);o["size"]=f.size();o["deletableBackup"]=String(dirName)=="/fm1/backups"&&name.endsWith(".bin")&&transportCanDeleteBackup(o["path"].as<String>());}}sendJson(d);});
  server.on("/api/export",HTTP_GET,[]{String path=server.arg("path");if(!storageReady||locked())return reject(409,"Storage unavailable or busy");if(!safePath(path)||path.endsWith(".part")||path=="/fm1/ca.pem")return reject(400,"Invalid path");File f=disk->open(path);if(!f||f.isDirectory())return reject(404,"File missing");server.sendHeader("Content-Disposition","attachment");server.setContentLength(f.size());server.send(200,"application/octet-stream","");exportFile=f;exportClient=server.client();exportLast=millis();exportActive=true;});
- server.on("/api/cancel",HTTP_POST,[]{if(transportCancel())reject(202,"Cancellation requested before writes");else reject(409,"Operation is not cancellable at this stage");});
+ server.on("/api/cancel",HTTP_POST,[]{if(cancelOperation())reject(202,"Cancellation requested; finishing the current sector");else reject(409,"Operation is not cancellable at this stage");});
  server.on("/api/restore",HTTP_POST,[]{String path=server.arg("path");if(!storageReady||locked())return reject(409,"Storage unavailable or busy");if(!safePath(path)||!path.startsWith("/fm1/backups/")||!path.endsWith(".bin")||!disk->exists(path))return reject(400,"Select an existing backup .bin file");if(!pendingAction.arm(fm1::ActionKind::Restore,path.c_str(),path.c_str()))return reject(409,"Another confirmation is already armed");actionMenu=false;searchPicker=false;detail=false;confirmInstall=true;dirty=true;reject(202,"Restore armed. Hold the on-device confirmation control for two seconds to start; cancel on-device to dismiss.");});
- server.on("/api/delete-backup",HTTP_POST,[]{String path=server.arg("path");if(!storageReady||locked())return reject(409,"Storage unavailable or busy");if(!safePath(path)||!path.startsWith("/fm1/backups/")||!path.endsWith(".bin"))return reject(400,"Select a backup .bin file");if((pendingAction.active()&&path==pendingAction.snapshot().path)||!transportCanDeleteBackup(path))return reject(409,"Active or last verified backup is protected");if(!disk->remove(path))return reject(404,"Cannot remove backup");disk->remove(path.substring(0,path.length()-4)+".json");reject(200,"Older backup deleted");});
+ server.on("/api/delete-backup",HTTP_POST,[]{String path=server.arg("path");if(!storageReady||locked())return reject(409,"Storage unavailable or busy");if(!safePath(path)||!path.startsWith("/fm1/backups/")||!path.endsWith(".bin"))return reject(400,"Select a backup .bin file");if((pendingAction.active()&&path==pendingAction.snapshot().path)||!transportCanDeleteBackup(path))return reject(409,"Backup unavailable or operation in progress");if(!transportDeleteBackup(path))return reject(404,"Cannot remove backup");reject(200,"Backup deleted");});
  server.on("/api/delete",HTTP_POST,[]{String path=server.arg("path");if(!storageReady||locked())return reject(409,"Storage unavailable or busy");if(!safePath(path)||!path.startsWith("/fm1/packages/")||!path.endsWith(".fwsc"))return reject(400,"Only saved packages may be deleted");if(!disk->remove(path))return reject(404,"Cannot remove file");disk->remove(path+".json");loadCatalogue();reject(200,"Package deleted");});
 #ifndef FM1_CARDPUTER
  server.on("/api/format",HTTP_POST,[]{if(storageReady||locked())return reject(409,"Initialization is available only when internal storage failed to mount");if(server.arg("confirm")!="FORMAT INTERNAL STORAGE")return reject(400,"Explicit FORMAT INTERNAL STORAGE confirmation required");if(!LittleFS.format()||!LittleFS.begin(false))return reject(500,"Filesystem initialization failed");storageReady=true;for(auto path:{"/fm1","/fm1/packages","/fm1/backups","/fm1/logs"})disk->mkdir(path);loadCatalogue();reject(200,"Internal storage initialized");});
 #endif
- server.begin();
+ webConfigured=true;if(wifiEnabled)server.begin();
 }
 void selectStep(int amount);
 void chooseAction();
 #include "local_app.inc"
 void selectStep(int amount){size_t n=matchCount();if(n){selected=(selected+n+amount)%n;dirty=true;}}
 void installConfirm(){if(locked())return;int idx=selectedIndex();if(idx<0){notice="Save a validated package first";return;}auto selectedEntry=readEntry(idx);if(selectedEntry.path.isEmpty()){notice="Save a validated package first";return;}String label=selectedEntry.name+" "+selectedEntry.version;if(!pendingAction.arm(fm1::ActionKind::Install,selectedEntry.path.c_str(),label.c_str()))return;confirmInstall=true;dirty=true;}
-void downloadSelected(){int i=selectedIndex();if(i<0||!storageReady||locked())return;auto e=readEntry(i);if(!e.downloadable){notice="External installer / no maker package";dirty=true;return;}if(!e.path.isEmpty()){notice="Already saved offline";dirty=true;return;}Job next;next.path="/fm1/packages/"+fileId(e.id+"|"+e.sha256)+".fwsc";next.download=true;next.id=e.id;startJob(next);dirty=true;}
-void refreshSelected(){if(!storageReady||locked())return;if(freeSpace()<reserveBytes()+64*1024){notice="Catalogue scratch reserve unavailable";dirty=true;return;}Job next;next.path="/fm1/catalogue.json";next.download=false;next.catalogue=true;next.refresh=true;startJob(next);dirty=true;}
+void downloadSelected(){int i=selectedIndex();if(i<0||!storageReady||locked())return;auto e=readEntry(i);if(!e.downloadable){notice="External installer / no maker package";dirty=true;return;}if(!e.path.isEmpty()){notice="Already saved offline";dirty=true;return;}Job next;next.path="/fm1/packages/"+fileId(e.id+"|"+e.sha256)+".fwsc";next.download=true;next.id=e.id;requestNetworkJob(next);dirty=true;}
+void refreshSelected(){if(!storageReady||locked())return;if(freeSpace()<reserveBytes()+64*1024){notice="Catalogue scratch reserve unavailable";dirty=true;return;}Job next;next.path="/fm1/catalogue.json";next.download=false;next.catalogue=true;next.refresh=true;requestNetworkJob(next);dirty=true;}
 void connectOrBackup(){if(locked())return;if(!storageReady){notice="Storage unavailable; Wi-Fi Files for setup";dirty=true;return;}auto s=transportStatus();if(s.connected)transportBackup();else transportConnect();dirty=true;}
 void chooseAction() {
     switch (actionIndex) {
     case 0: setMainTab(0); return;
     case 1: setMainTab(1); return;
-    case 2: setMainTab(2); return;
-    case 3: openEditor(local::EditTarget::Search, query, 48); return;
-    case 4: {
+    case 2: openEditor(local::EditTarget::Search, query, 48); return;
+    case 3: {
         int index = selectedIndex();
         if (index >= 0 && !locked()) toggleFavorite(index);
         break;
     }
-    case 5: downloadSelected(); break;
-    case 6: installConfirm(); break;
-    case 7:
+    case 4: downloadSelected(); break;
+    case 5: installConfirm(); break;
+    case 6:
         if (!locked()) transportConnect();
         break;
-    case 8:
+    case 7:
         if (!locked() && storageReady) transportBackup();
         else notice = "Storage unavailable or busy";
         break;
-    case 9: openBackups(); return;
-    case 10: beginWifiScan(); return;
-    case 11: refreshSelected(); break;
-    case 12: {
+    case 8: openBackups(); return;
+    case 9: beginWifiScan(); return;
+    case 10: refreshSelected(); break;
+    case 11: {
         size_t next = 0;
         if (categoryFilter != "all") {
             for (size_t i = 0; i < categoryCount; ++i) if (categories[i] == categoryFilter) next = i + 1;
@@ -234,26 +285,27 @@ void chooseAction() {
         dirty = true;
         return;
     }
-    case 13:
+    case 12:
         releaseFilter = releaseFilter == "all" ? "stable" : releaseFilter == "stable" ? "beta" : "all";
         selected = 0; dirty = true; return;
-    case 14:
+    case 13:
         compatibilityFilter = compatibilityFilter == "all" ? "declared" : compatibilityFilter == "declared" ? "incompatible" : compatibilityFilter == "incompatible" ? "unknown" : "all";
         selected = 0; dirty = true; return;
-    case 15:
+    case 14:
         sortOrder = sortOrder == "popular" ? "name" : sortOrder == "name" ? "newest" : "popular";
         selected = 0; dirty = true; return;
-    case 16: favoritesOnly = !favoritesOnly; selected = 0; dirty = true; return;
-    case 17:
+    case 15: favoritesOnly = !favoritesOnly; selected = 0; dirty = true; return;
+    case 16:
         if (!storageReady) { localPage = LocalPage::Setup; actionMenu = false; dirty = true; }
         else {
 #ifdef FM1_CARDPUTER
-            showLocalInfo("Storage", readableBytes(freeSpace()) + " free. Files are in /fm1 on the SD card. For web export join FM1-Flip, key " + apPassword + ", then open 192.168.4.1.");
+            showLocalInfo("Storage", readableBytes(freeSpace()) + " free. Files are in /fm1 on the SD card. For browser access use Home > Web UI / hotspot.");
 #else
-            showLocalInfo("Storage", readableBytes(freeSpace()) + " free. For optional file export join FM1-Flip, key " + apPassword + ", then open 192.168.4.1. Wi-Fi and normal switching work entirely on-device.");
+            showLocalInfo("Storage", readableBytes(freeSpace()) + " free. For browser access use Home > Web UI / hotspot. Wi-Fi and normal switching work entirely on-device.");
 #endif
         }
         return;
+    case 17: localPage=LocalPage::WebUi;actionMenu=false;hotspotSelected=0;dirty=true;return;
     case 18: {
         auto status = transportStatus();
         String message = status.stage + ": " + status.detail;
@@ -263,6 +315,7 @@ void chooseAction() {
         showLocalInfo("Last result", message);
         return;
     }
+    case 19: setMainTab(2); return;
     default: showHome(); return;
     }
     if (!confirmInstall) actionMenu = false;
@@ -280,7 +333,7 @@ void appSetup(){
  cfg.fallback_board=m5::board_t::board_M5StickS3;
 #endif
 #ifdef FM1_CARDPUTER
- M5Cardputer.begin(cfg,true);DISPLAY.setRotation(1);
+ M5Cardputer.begin(cfg,true);DISPLAY.setRotation(0); // Panel already has a 90-degree mounting offset.
 #else
  M5.begin(cfg);DISPLAY.setRotation(1);
 #endif
@@ -292,14 +345,33 @@ void appSetup(){
  storageReady=LittleFS.begin(false);disk=&LittleFS;
 #endif
  if(storageReady){for(auto path:{"/fm1","/fm1/packages","/fm1/backups","/fm1/logs"})disk->mkdir(path);loadCatalogue();}else { notice="Storage setup needed"; localPage=LocalPage::Setup; }
- transportBegin(*disk);char pass[20];snprintf(pass,sizeof(pass),"fm1-%08lx",(unsigned long)(ESP.getEfuseMac()&0xffffffff));apPassword=pass;WiFi.mode(WIFI_AP_STA);configTime(0,0,"pool.ntp.org","time.cloudflare.com");WiFi.softAP("FM1-Flip",apPassword.c_str());String ssid=preferences.getString("ssid","");if(!ssid.isEmpty())WiFi.begin(ssid.c_str(),preferences.getString("password","").c_str());configureWeb();dirty=true;
+ transportBegin(*disk);char pass[20];snprintf(pass,sizeof(pass),"fm1-%08lx",(unsigned long)(ESP.getEfuseMac()&0xffffffff));apPassword=pass;
+ WiFi.onEvent([](arduino_event_id_t event,arduino_event_info_t info){
+  if(event==ARDUINO_EVENT_WIFI_STA_DISCONNECTED)wifiDisconnectReason.store(info.wifi_sta_disconnected.reason);
+ });
+ setWifiPower(preferences.getBool("wifiEnabled",true));
+ configureWeb();dirty=true;
 }
+#ifdef FM1_CARDPUTER
+namespace {
+bool cardputerBackPressed() {
+ auto& keyboard=M5Cardputer.Keyboard;
+ const auto& keys=keyboard.keysState();
+ // The physical top-left ESC key is reported as backtick by M5Cardputer.
+ return keyboard.isKeyPressed('`') || keyboard.isKeyPressed(char(27)) ||
+  (!searchPicker && keyboard.isKeyPressed(',')) ||
+  std::find(keys.hid_keys.begin(),keys.hid_keys.end(),uint8_t(0x29))!=keys.hid_keys.end();
+}
+}
+#endif
 void appLoop() {
 #ifdef FM1_CARDPUTER
     M5Cardputer.update();
 #else
     M5.update();
 #endif
+    if(pendingWifiPower>=0 && int32_t(millis()-hotspotChangeAt)>=0){setWifiPower(pendingWifiPower!=0);pendingWifiPower=-1;}
+    if(pendingHotspot>=0 && int32_t(millis()-hotspotChangeAt)>=0){setHotspot(pendingHotspot!=0);pendingHotspot=-1;dirty=true;}
     transportTick();
     if (exportActive) exportTick();
     else server.handleClient();
@@ -314,11 +386,11 @@ void appLoop() {
     auto transport = transportStatus();
     if (jobBusy.load() || transport.busy) {
 #ifdef FM1_CARDPUTER
-        if (M5Cardputer.Keyboard.keysState().fn && M5Cardputer.Keyboard.isKeyPressed('`')) transportCancel();
+        if (cardputerBackPressed()) cancelOperation();
 #else
         // The progress display stays visible, but Home becomes the return view.
         if (stickAction == local::StickAction::Actions) showHome();
-        if (stickAction == local::StickAction::Back) transportCancel();
+        if (stickAction == local::StickAction::Back) cancelOperation();
 #endif
         paintLocalTick();
         delay(2);
@@ -332,17 +404,18 @@ void appLoop() {
     auto& keyboard = M5Cardputer.Keyboard;
     if (keyboard.isChange() && keyboard.isPressed()) {
         auto keys = keyboard.keysState();
-        if (keys.fn && keyboard.isKeyPressed('`')) backLocal();
+        if (cardputerBackPressed()) backLocal();
         else if (confirmInstall || localConfirmation != LocalConfirmation::None) {
             // The physical snapshot is frozen: no navigation or typing while reviewing.
         } else if (searchPicker) {
-            if (keys.enter) completeEditor();
+            if (keys.tab && textEditor.target() == local::EditTarget::Password) {textEditor.togglePasswordVisibility();dirty=true;}
+            else if (keys.enter) completeEditor();
             else if (keys.del) { textEditor.backspace(); dirty = true; }
             else for (char character : keys.word) {
                 if (textEditor.type(character)) dirty = true;
             }
         } else if (keys.fn && keyboard.isKeyPressed('f')) showHome();
-        else if (keys.enter) activateLocal();
+        else if (keys.enter || keyboard.isKeyPressed('/')) activateLocal();
         else if (keys.tab && !actionMenu && localPage == LocalPage::Home) setMainTab(mainTab + 1);
         else if (keys.del && !query.isEmpty() && localPage == LocalPage::Home && !actionMenu) {
             query.remove(query.length() - 1); selected = 0; dirty = true;
@@ -364,7 +437,7 @@ void appLoop() {
             }
         }
     }
-    confirmHeld = keyboard.keysState().enter;
+    confirmHeld = keyboard.keysState().enter || (!searchPicker && keyboard.isKeyPressed('/'));
     if (!confirmInstall) { heldSince = 0; holdFired = false; }
 #else
     switch (stickAction) {

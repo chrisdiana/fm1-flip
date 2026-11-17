@@ -22,7 +22,7 @@ struct Frame {
     std::string editorValue, editorCharacter, editorGroup;
     std::vector<Row> rows;
     uint32_t completed = 0, total = 0;
-    bool busy = false, warning = false, connected = false;
+    bool busy = false, warning = false, connected = false, wifiConnected = false;
 };
 
 class Canvas {

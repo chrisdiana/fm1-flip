@@ -10,19 +10,20 @@ out=root/'build/releases';out.mkdir(parents=True,exist_ok=True)
 # Remove the obsolete generated ADV-only artifact after target consolidation.
 (out/'fm1-flip-cardputer-adv-factory.bin').unlink(missing_ok=True)
 manifest={}
-inputs = sorted([root/'platformio.ini', root/'tools/embed_assets.py', root/'web/index.html',
-                 *(root/'src').rglob('*'), *(root/'include').rglob('*'), *(root/'partitions').glob('*.csv')])
+inputs = sorted([root/'platformio.ini', root/'tools/embed_assets.py', root/'tools/tls_sdk.py', root/'web/index.html',
+                 *(root/'src').rglob('*'), *(root/'include').rglob('*')])
 inputs = [path for path in inputs if path.is_file()]
-source_hash=hashlib.sha256()
-for path in inputs:
-    source_hash.update(path.relative_to(root).as_posix().encode()+b'\0'+path.read_bytes()+b'\0')
 for board in dict.fromkeys('cardputer' if board=='cardputer-adv' else board for board in a.boards):
     build=root/'.pio/build'/board
+    board_inputs = [*inputs, root/'partitions'/f'{board}.csv']
+    source_hash=hashlib.sha256()
+    for path in board_inputs:
+        source_hash.update(path.relative_to(root).as_posix().encode()+b'\0'+path.read_bytes()+b'\0')
     for name in ['bootloader.bin','partitions.bin','firmware.bin']:
         if not (build/name).is_file(): raise SystemExit('Build first: pio run -e '+board)
-    if any(path.stat().st_mtime_ns > (build/'firmware.bin').stat().st_mtime_ns for path in inputs):
+    if any(path.stat().st_mtime_ns > (build/'firmware.bin').stat().st_mtime_ns for path in board_inputs):
         raise SystemExit('Source is newer than '+board+' binary; rebuild before packaging')
-    target=out/('fm1-flip-'+board+'-factory.bin')
+    target=out/('fm1-flip-'+board+'.bin')
     subprocess.run([sys.executable,str(a.esptool),'--chip','esp32s3','merge-bin','--flash-size','8MB','-o',str(target),'0x0',str(build/'bootloader.bin'),'0x8000',str(build/'partitions.bin'),'0x10000',str(build/'firmware.bin')],check=True)
     manifest[target.name]={'sha256':hashlib.sha256(target.read_bytes()).hexdigest(),'bytes':target.stat().st_size,
                           'sourceSha256':source_hash.hexdigest(),'hardwareValidated':False}

@@ -7,7 +7,7 @@ int main(){
  backLocal();assert(actionMenu&&homeMenu&&actionIndex==1&&selected==7);
  backLocal();assert(actionMenu&&homeMenu); // Back at root is a no-op.
  setMainTab(1);selected=7;detail=true;
- openActionMenu(true);assert(actionMenu&&!homeMenu&&actionIndex==6);
+ openActionMenu(true);assert(actionMenu&&!homeMenu&&actionIndex==5);
  backLocal();assert(!actionMenu&&detail&&selected==7);
  backLocal();assert(!actionMenu&&!detail&&selected==7);
  showHome();assert(actionMenu&&homeMenu&&!detail);

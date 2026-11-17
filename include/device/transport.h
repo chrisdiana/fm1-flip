@@ -29,6 +29,7 @@ uint64_t transportBackupReserve();
 bool transportCancel();
 bool transportCanCancel();
 bool transportCanDeleteBackup(const String& path);
+bool transportDeleteBackup(const String& path);
 bool transportRestore(const String& path);
 uint32_t transportStackWatermark();
 bool transportInstall(const String& path);
