@@ -38,12 +38,13 @@ bool start(Info* info,void(*)(const char*,...),char*,size_t){events.push_back("l
 bool read(uint32_t,uint8_t* data,size_t n,char*,size_t){memset(data,0,n);return true;}
 }
 jl::Info chip;
-enum class Peer { Running,DirectRom,Cold,Unknown,Missing,NoIdentity,NoRom };
+enum class Peer { Running,DirectRom,Cold,Unknown,Missing,NoIdentity,NoRom,EnumFailure };
 Peer peer=Peer::Running;
-bool enumerated=false,romRequested=false,keyed=false,calibrated=false,interrupted=false;
+bool enumerated=false,romRequested=false,keyed=false,calibrated=false,interrupted=false,portSignal=false;
 namespace host {
 bool stop(){events.push_back("stop");if(romRequested)interrupted=true;enumerated=false;return true;}
 bool connected(){return enumerated;}
+bool port_attached(){return portSignal;}
 bool is_midi(){return enumerated && !romRequested && (peer==Peer::Running||peer==Peer::NoIdentity||peer==Peer::NoRom);}
 bool wait_reconnect(uint32_t,uint16_t* vid,uint16_t* pid,void(*)(const char*,...),char* error,size_t n){
  events.push_back("reconnect");
@@ -55,6 +56,7 @@ bool midi_send_sysex(const uint8_t*,size_t,char*,size_t){events.push_back("rom-r
 bool queryFirmware(String& product,String& error){events.push_back("identity");if(peer==Peer::NoIdentity){error="No valid identity";return false;}product="Fixture";return true;}
 bool startAndWait(uint16_t& vid,uint16_t& pid,String& error){
  events.push_back("enumerate");hostStarted=true;
+ if(peer==Peer::EnumFailure){portSignal=true;error="USB detected; enumeration timed out";return false;}
  if(peer==Peer::Missing || (peer==Peer::Cold&&!calibrated) || interrupted || (peer==Peer::NoRom&&romRequested)){error="no USB device";return false;}
  enumerated=true;vid=peer==Peer::Unknown?0x1234:host::is_midi()?0x1235:0x4c4a;pid=host::is_midi()?0x1111:0x8057;return true;
 }

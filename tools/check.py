@@ -34,3 +34,8 @@ subprocess.run([sys.executable, 'tools/check_transport_flow.py'], cwd=root, chec
 subprocess.run([sys.executable, 'tools/check_navigation.py'], cwd=root, check=True)
 
 subprocess.run([sys.executable, 'tools/check_local_search.py'], cwd=root, check=True)
+
+
+for board in ('sticks3', 'cardputer'):
+    if next((pathlib.Path.home()/'.platformio/packages').glob('framework-espidf*/components/usb/enum.c'), None):
+        subprocess.run([sys.executable, 'tools/check_usb_descriptor_limit.py', '--env', board], cwd=root, check=True)

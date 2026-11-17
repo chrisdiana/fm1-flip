@@ -28,3 +28,11 @@ backup-*.json
 
 # Local hardware upload history
 /docs/FLASH-LOG.md
+
+# HybridCompile-generated SDK configuration (source options live in platformio.ini)
+/sdkconfig
+/sdkconfig.*
+/.dummy/
+/managed_components/
+/dependencies.lock
+/CMakeLists.txt

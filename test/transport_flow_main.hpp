@@ -1,7 +1,7 @@
 int main(){
- for(auto scenario:{Peer::Running,Peer::DirectRom,Peer::Cold,Peer::Unknown,Peer::Missing,Peer::NoIdentity,Peer::NoRom}) {
+ for(auto scenario:{Peer::Running,Peer::DirectRom,Peer::Cold,Peer::Unknown,Peer::Missing,Peer::NoIdentity,Peer::NoRom,Peer::EnumFailure}) {
   peer=scenario;state={};chip={};hostStarted=false;identifiedFm1=false;observedFirmware="";
-  events.clear();enumerated=romRequested=keyed=calibrated=interrupted=false;
+  events.clear();enumerated=romRequested=keyed=calibrated=interrupted=portSignal=false;
   String error;bool ok=connectDevice(error);
   std::cout<<"Peer "<<int(peer)<<":";for(const auto& e:events)std::cout<<' '<<e;std::cout<<" -> "<<(ok?"OK":error)<<"\n";
   auto contains=[](const char* e){return std::find(events.begin(),events.end(),e)!=events.end();};
@@ -10,7 +10,7 @@ int main(){
   if(peer==Peer::Running && (!contains("identity")||!contains("reconnect")||contains("key")))return 1;
   if(peer==Peer::DirectRom && (contains("key")||contains("rom-request")))return 1;
   if(peer==Peer::Cold && (!keyed||!calibrated))return 1;
-  if((peer==Peer::NoIdentity||peer==Peer::Unknown) && (contains("key")||contains("rom-request")))return 1;
+  if((peer==Peer::NoIdentity||peer==Peer::Unknown||peer==Peer::EnumFailure) && (contains("key")||contains("rom-request")))return 1;
   if(ok && (!identifiedFm1||!state.connected))return 1;
   if(!ok && identifiedFm1)return 1;
  }

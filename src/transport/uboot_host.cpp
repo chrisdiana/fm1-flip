@@ -19,6 +19,10 @@
 
 namespace host {
 
+// Must match the rebuilt IDF enumeration driver, not an app-only -D override.
+static_assert(CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE >= 1024,
+              "Build with custom_sdkconfig USB control transfer size >= 1024");
+
 static constexpr uint32_t CBW_SIGNATURE = 0x43425355;  // "USBC"
 static constexpr uint32_t CSW_SIGNATURE = 0x53425355;  // "USBS"
 static constexpr uint32_t TIMEOUT_MS = 5000;           // M-Flasher: 10 s; a 64 KiB erase takes well under 1 s
@@ -107,6 +111,7 @@ static void channel_state(char *out, size_t n) {
 }
 
 static void log_phy(Log log) {
+    log("USB enumeration control limit: %u bytes", unsigned(CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE));
     log("PHY: rtc usb_conf %08lX wrap %08lX usj %08lX gintsts %08lX", (unsigned long)REG_READ(RTC_CNTL_USB_CONF_REG),
         (unsigned long)REG_READ(USB_WRAP_OTG_CONF_REG), (unsigned long)REG_READ(USB_SERIAL_JTAG_CONF0_REG),
         (unsigned long)REG_READ(OTG_GINTSTS));
@@ -322,6 +327,8 @@ bool start() {
     return true;
 }
 
+bool port_attached() { return ready && (REG_READ(OTG_HPRT) & 1); }
+
 bool connected() { return ready && dev && claimed && !gone.load() && !io_fault.load(); }
 
 // Walks the active configuration for the first interface with a bulk IN and
@@ -394,7 +401,9 @@ bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, cha
         drain_idf_log(log);
         if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(timeout_ms)) {
             log_phy(log);
-            snprintf(err, errlen, "No USB device (%lu ms): %.88s. Check data cable and FM-1 power.", (unsigned long)timeout_ms, now);
+            snprintf(err, errlen, "%s (%lu ms). %.88s",
+                     port_attached() ? "USB detected; enumeration timed out" : "No USB attachment; check data cable/power",
+                     (unsigned long)timeout_ms, now);
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(5));

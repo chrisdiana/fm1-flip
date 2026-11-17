@@ -80,7 +80,9 @@ void render(const Frame& frame, Canvas& canvas) {
     const int width = canvas.width(), height = canvas.height(), footerY = height - 19;
     canvas.beginFrame(Color::Background);
     canvas.rect(0, 0, width, 3, frame.warning ? Color::Warning : Color::Accent);
-    canvas.text(10, 11, fit(frame.title, canvas, width - 78, 2), Color::Text, 2);
+    // Keep diagnostic titles readable: use normal size before truncating.
+    const int titleScale = canvas.textWidth(frame.title, 2) <= width - 78 ? 2 : 1;
+    canvas.text(10, 11, fit(frame.title, canvas, width - 78, titleScale), Color::Text, titleScale);
     if (!frame.right.empty()) {
         std::string right = fit(frame.right, canvas, 62);
         canvas.text(width - canvas.textWidth(right) - 9, 15, right,

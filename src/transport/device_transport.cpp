@@ -219,7 +219,7 @@ bool connectDevice(String& error) {
  bool enumerated=startAndWait(vid,pid,error);
  if(!enumerated) {
   // A visible unsupported device is not a reason to drive raw recovery pulses.
-  if(vid || cancellation.load()==2)return false;
+  if(vid || cancellation.load()==2 || host::port_attached())return false;
   if(!host::stop()){error="USB cleanup failed; restart M5 before reconnecting";return false;}
   hostStarted=false;
   update("Boot-key connection","No USB device found. Keep cable attached; turn FM-1 OFF then ON now. Check its power source.");

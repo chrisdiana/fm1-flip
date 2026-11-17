@@ -2,7 +2,7 @@ int main(){
  auto has=[](const char* e){return std::find(events.begin(),events.end(),e)!=events.end();};
  for(int scenario=0;scenario<8;++scenario){
   events.clear();state={};chip={};hostStarted=false;identifiedFm1=false;
-  enumerated=romRequested=keyed=calibrated=interrupted=false;peer=Peer::Running;
+  enumerated=romRequested=keyed=calibrated=interrupted=portSignal=false;peer=Peer::Running;
   packageValid=packagePresent=backupOk=true;metadataSupport="new";cancellation.store(1);
   if(scenario==1)packageValid=false;
   if(scenario==2)metadataSupport="unknown";

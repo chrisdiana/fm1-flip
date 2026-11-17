@@ -2,7 +2,7 @@
 
 A portable M-VAVE FM-1 firmware manager for **M5Stack StickS3, Cardputer ADV, and original Cardputer**. Browse firmware, download packages, install them on an FM-1, and optionally save backups without a computer. A local web interface is also available.
 
-Development firmware: StickS3 uploads and basic UI operation have been observed, but the latest FM-1 USB connection, backup, install and restore flows still need hardware validation. See [hardware validation](docs/HARDWARE-VALIDATION.md) for the cable/power checks.
+Development firmware: StickS3 uploads, basic UI operation and connection to an FM-1 running Patchwerk have been observed. FM-1 backup, install and restore flows, both Cardputer variants, and physical M5Launcher installation still need hardware validation. See [hardware validation](docs/HARDWARE-VALIDATION.md) for the cable/power checks.
 
 ## Install with M5Launcher
 
@@ -160,7 +160,8 @@ The browser can queue downloads and imports; installation uses handheld controls
 | No firmware in Downloaded | Download a supported package first; clear search and filters |
 | Download or refresh fails | Connect station Wi-Fi, allow clock synchronization, check storage and read **Last operation** |
 | Catalogue will not refresh again | Hub reads are throttled to once per 24 hours; cached browsing still works |
-| No FM-1 detected | Check the data cable and FM-1 power arrangement; follow the displayed off/on fallback if requested |
+| No USB attachment | Check the data cable and FM-1 power arrangement; follow the displayed off/on fallback if requested |
+| USB detected; enumeration timed out | The root port detects a peer but has no usable USB device yet. Read Last operation and export the USB session log; record the FM-1 firmware and cable/power setup. No raw boot-key pulses are sent to this attached peer |
 | FM-1 screen goes dark during connection | It may be in ROM mode. Read the M5's connection stage/error; darkness alone does not establish loss of power |
 | Install is refused | Read **Last operation** for package, hash, chip compatibility or hardware identification details |
 | Storage is full | Export/remove unwanted packages or eligible backups; installs do not automatically save backups |
@@ -170,7 +171,7 @@ Export `/fm1/logs/session-N.txt` through **Files & backups** when investigating 
 
 ## Build and checks
 
-Install PlatformIO, then run from this directory:
+Install PlatformIO, then run from this directory. The first build downloads ESP-IDF and rebuilds the SDK through pioarduino HybridCompile so composite USB descriptors larger than the stock 256-byte limit can enumerate; allow additional build time and disk space:
 
 ```sh
 pio run -e cardputer -e sticks3

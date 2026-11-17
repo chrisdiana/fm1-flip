@@ -13,13 +13,14 @@ struct PhysicalDisplay { int visibleClears = 0, presents = 0; };
 struct OffscreenBuffer {
     PhysicalDisplay& physical;
     int clears = 0, scale = 1;
+    std::vector<std::string> texts;
     int width() const { return 240; }
     int height() const { return 135; }
     void fillScreen(uint32_t) { ++clears; }
     void fillRoundRect(int, int, int, int, int, uint32_t) {}
     void setTextSize(int value) { scale = value; }
     void setTextColor(uint32_t) {}
-    void drawString(const char*, int, int) {}
+    void drawString(const char* text, int, int) { texts.emplace_back(text); }
     int textWidth(const char* value) const { return std::char_traits<char>::length(value) * 6 * scale; }
     void pushSprite(int, int) { ++physical.presents; }
 };
@@ -142,8 +143,16 @@ int main(int argc, char** argv) {
     search.nextGroup();assert(std::string(search.groupLabel())=="numbers");
     const std::string directory = argc > 1 ? argv[1] : "";
     PhysicalDisplay display;
-    OffscreenBuffer buffer{display};
+    OffscreenBuffer buffer{display, 0, 1, {}};
     BufferedCanvas<OffscreenBuffer> canvas(buffer, true);
+    Frame errorTitle;
+    errorTitle.screen = Screen::Info;
+    errorTitle.title = "Could not finish";
+    errorTitle.body = "No USB device: port conn1 ena1 pwr1 line D+1 D-1 spd1";
+    render(errorTitle, canvas);
+    assert(std::find(buffer.texts.begin(), buffer.texts.end(), "Could not finish") != buffer.texts.end());
+    display.presents = 0;
+    buffer.clears = 0;
     Frame browse;
     browse.title = "Discover"; browse.eyebrow = "POPULAR  /  217 FIRMWARES";
     browse.right = "USB ROM"; browse.connected = true;

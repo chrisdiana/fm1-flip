@@ -26,6 +26,8 @@ bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, cha
 // Wait for the current device to disconnect and claim its replacement without
 // tearing down the host/root port (MIDI -> ROM and ROM -> firmware handoffs).
 bool wait_reconnect(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, char *err, size_t errlen);
+// Electrical root-port presence only; does not establish device identity.
+bool port_attached();
 bool connected();
 // USB-MIDI 1.0 interface (Audio class 1 / MIDIStreaming subclass 3).
 // These APIs share the same exclusive worker as execute(); replies are capped

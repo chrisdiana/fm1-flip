@@ -47,3 +47,7 @@ StickS3 has been flashed and its display observed by the user. The user reported
 Install no longer calls the backup workflow or reserves space for a full image. Its direct writer validates the package, preflights replacement-sector reads, records five boot/calibration sector CRCs in RAM, verifies changed-sector readback and rechecks protected CRCs. Create backup is a separate explicit Home action and auto-connects when needed. Restore remains a distinct operation with its existing rollback-backup requirements. A direct install has no automatically retained rollback image. Existing backup files are not removed.
 
 Hold B repeats every 300 ms on lists and 150 ms in text editors after the initial 500 ms hold. Search entry skips uppercase and normalizes keyboard input to lowercase; matching remains case-insensitive. SSID/password entry retains exact printable ASCII.
+
+## 2026-11-16 connection confirmation
+
+The user confirmed successful connection between StickS3 and an FM-1 running Patchwerk over a direct USB-C cable after the test build with the rebuilt 1024-byte enumeration buffer. The upload was app-only and its data hash verified. This confirms that connection scenario; it does not establish FM-1 installation/backup/restore, Cardputer/ADV operation or physical M5Launcher installation. No FM-1 flash write was performed by the development agent.
