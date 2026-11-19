@@ -21,7 +21,7 @@ struct {int state=3;IP ip;int status(){return state;}IP localIP(){return ip;}}Wi
 #include <cstring>
 struct WiFiClientSecure{int code=0;int lastError(char* text,size_t n){if(code)strncpy(text,"TLS allocation failed",n);return code;}};
 ''')
- (p/'HTTPClient.h').write_text('#pragma once\n')
+ (p/'HTTPClient.h').write_text('#pragma once\nstruct HTTPClient{static String errorToString(int code){return code==-8?String("too less ram"):String("connection lost");}};\n')
  (p/'esp_heap_caps.h').write_text('#pragma once\n#define MALLOC_CAP_8BIT 1\ninline unsigned heap_caps_get_largest_free_block(int){return 8192;}\n')
  (p/'main.cpp').write_text(r'''
 #include <time.h>
@@ -39,6 +39,12 @@ int main(){using namespace device;
  auto failure=httpsFailure(-1,tls,"https://api.github.com/example?private=fixture");
  assert(failure.find("TLS allocation failed")!=String::npos&&failure.find("8192")!=String::npos);
  assert(failure.find("private")==String::npos&&failure.find("api.github.com")!=String::npos);
+ auto interrupted=downloadFailure(-8,12345,700000,tls,"https://release-assets.githubusercontent.com/file?token=secret");
+ assert(interrupted.find("12345 of 700000 bytes")!=String::npos);
+ assert(interrupted.find("too less ram")!=String::npos&&interrupted.find("(-8)")!=String::npos);
+ assert(interrupted.find("token")==String::npos&&interrupted.find("secret")==String::npos);
+ auto shortBody=downloadFailure(12,12,100,tls,"https://example.com/file");
+ assert(shortBody.find("12 of 100 bytes")!=String::npos&&shortBody.find("length mismatch")!=String::npos);
  assert(wifiJoinFailure(0,202).find("Authentication")!=String::npos);
  assert(wifiJoinFailure(1,201).find("2.4 GHz")!=String::npos);
  std::cout<<"Network diagnostics: offline, no IP, NTP clock, TLS allocation detail and safe hostname passed\n";
@@ -47,6 +53,7 @@ int main(){using namespace device;
  subprocess.run(['c++','-std=c++17','-Wall','-Wextra','-Werror','-I'+str(p),'-I'+str(root/'include'),str(p/'main.cpp'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
 source=(root/'src/device/app.cpp').read_text()
+assert 'downloadFailure(received,sink.bytesWritten(),expected,client,currentUrl)' in source
 policy=source[source.index('bool setHotspot('):source.index('void configureWeb()')].replace('.isEmpty()', '.empty()')
 with tempfile.TemporaryDirectory(prefix='fm1-hotspot-') as name:
  p=Path(name)

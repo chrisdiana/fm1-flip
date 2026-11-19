@@ -6,7 +6,8 @@
 namespace device {
 using NetworkProgress = void (*)(const String&,const String&,uint32_t,uint32_t);
 using CatalogueVisitor = std::function<void(uint32_t,JsonObject)>;
-String scanCatalogue(File&,const CatalogueVisitor& visitor = CatalogueVisitor());
+struct CatalogueMetadata {String retrievedAt,sourceUrl,attribution,license;};
+String scanCatalogue(File&,const CatalogueVisitor& visitor = CatalogueVisitor(),CatalogueMetadata* metadata=nullptr);
 void commitCatalogueCache();
 using ScratchSpace = std::function<uint64_t()>;
 String refreshHub(fs::FS&, const String& pending, NetworkProgress, ScratchSpace);

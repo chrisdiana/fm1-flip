@@ -98,13 +98,14 @@ String get(fs::FS& fs,const String& url,const String& path,uint32_t limit,Networ
 }
 } // namespace
 void commitCatalogueCache(){Preferences cache;cache.begin("fm1-catalogue",false);cache.putString("etag",cache.getString("nextEtag"));cache.putString("modified",cache.getString("nextModified"));}
-String scanCatalogue(File& file,const CatalogueVisitor& visitor){
+String scanCatalogue(File& file,const CatalogueVisitor& visitor,CatalogueMetadata* metadata){
  if(!file||file.size()>1024*1024||nextNonSpace(file)!='{')return "Invalid catalogue root or size";
  bool schema=false,entries=false;size_t count=0;uint32_t ids[512];
  while(true){int c=nextNonSpace(file);if(c=='}')break;if(c!='"')return "Invalid catalogue key";file.seek(file.position()-1);JsonDocument key;LimitedStream ks(file,128);if(deserializeJson(key,ks)||nextNonSpace(file)!=':')return "Invalid catalogue member";String name=key.as<String>();
  if(name=="entries"){if(entries||nextNonSpace(file)!='[')return "Invalid entries";entries=true;
  while(true){c=nextNonSpace(file);if(c==']')break;if(c!='{'||count>=512)return "Too many or invalid entries";uint32_t offset=file.position()-1;file.seek(offset);JsonDocument item;LimitedStream bounded(file,8192);if(deserializeJson(item,bounded,DeserializationOption::NestingLimit(8)))return "Oversized or invalid entry";String id=item["id"]|"";String title=item["name"]|"";if(id.isEmpty()||id.length()>96||title.isEmpty()||title.length()>256)return "Invalid entry identity";uint32_t fingerprint=2166136261;for(auto b:id){fingerprint^=(uint8_t)b;fingerprint*=16777619;}for(size_t i=0;i<count;i++)if(ids[i]==fingerprint)return "Duplicate entry identity";ids[count++]=fingerprint;if(visitor)visitor(offset,item.as<JsonObject>());c=nextNonSpace(file);if(c==']')break;if(c!=',')return "Invalid entry delimiter";vTaskDelay(1);}
- }else{JsonDocument value;if(!readMember(file,value,2048))return "Oversized catalogue metadata";if(name=="schemaVersion")schema=value.as<int>()==1;}
+ }else{JsonDocument value;if(!readMember(file,value,2048))return "Oversized catalogue metadata";if(name=="schemaVersion")schema=value.as<int>()==1;
+ if(metadata){if(name=="retrievedAt")metadata->retrievedAt=clip(value.as<String>(),64);else if(name=="sourceUrl")metadata->sourceUrl=clip(value.as<String>(),256);else if(name=="attribution")metadata->attribution=clip(value.as<String>(),256);else if(name=="license")metadata->license=clip(value.as<String>(),64);}}
  c=nextNonSpace(file);if(c=='}')break;if(c!=',')return "Invalid catalogue delimiter";
  }
  if(nextNonSpace(file)!=-1)return "Trailing catalogue data";

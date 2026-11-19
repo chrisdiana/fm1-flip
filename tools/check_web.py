@@ -54,6 +54,11 @@ DRIVER = r'''<script>
   [...document.querySelectorAll('#detailbody button')].find(b=>b.textContent==='Download to device').click();
   await wait(()=>document.querySelector('#message').textContent.includes('queued'));
   document.querySelector('#detail').close();
+  details({id:'jiant',name:'JIANT FM',downloadable:false,downloadReason:'JIANT requires its maker installer for additional components.'});
+  assert(document.querySelector('#detailbody').textContent.includes('Maker installer'),'External installer badge missing');
+  assert(document.querySelector('#detailbody').textContent.includes('additional components'),'Installer reason missing');
+  assert(![...document.querySelectorAll('#detailbody button')].some(b=>b.textContent==='Download to device'),'Unsupported download offered');
+  document.querySelector('#detail').close();
   document.querySelector('[data-view=library]').click();
   await wait(()=>document.querySelectorAll('#library-list article').length===2);
   assert(document.querySelector('#library-list').textContent.includes('Legacy saved firmware'),'Saved releases missing outside catalogue');

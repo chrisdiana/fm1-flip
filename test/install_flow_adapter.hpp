@@ -8,6 +8,7 @@ constexpr uint32_t FlashSize=0x100000;
 uint32_t backupCrc=1;
 String backupPath="/fm1/backups/backup-1.bin";
 const String fixtureHash(64,'a');
+bool sidecarPresent=true;String catalogueHash,catalogueSupport,catalogueFailure;
 struct File {
  String bytes;size_t offset=0,length=0;bool present=true;
  explicit operator bool()const{return present;}
@@ -21,6 +22,7 @@ struct Disk {
  File open(const String& path,int=0){
   if(path==backupPath)return {"",0,FlashSize,true};
   if(path=="/fm1/packages/test.fwsc")return {"package",0,0,packagePresent};
+  if(path=="/fm1/packages/test.fwsc.json"&&!sidecarPresent)return {"",0,0,false};
   if(path=="/fm1/packages/test.fwsc.json")return {"{\"sha256\":\""+fixtureHash+"\",\"chip\":\""+metadataSupport+"\"}"};
   return {"",0,0,false};
  }
@@ -38,7 +40,7 @@ const char* errorMessage(WriteError){return "Write error";}
 WriteReport writePackageWithoutBackup(RomFlash&,PackageReader&,DeviceModel,void(*)(uint32_t,uint32_t,uint32_t,void*),void*,bool(*)(void*)) {events.push_back("write");if(cancelDuringWrite){cancellation.store(2);return {WriteError::Cancelled,0,1};}return {};}
 }
 String packageHash(File&){events.push_back("hash");return fixtureHash;}
-String scanCatalogue(File&,std::function<void(uint32_t,JsonObject)>){return "";}
+String scanCatalogue(File&,std::function<void(uint32_t,JsonObject)> visit){if(!catalogueHash.empty()){JsonDocument entry;entry["sha256"]=catalogueHash;entry["chip"]=catalogueSupport;visit(1,entry.as<JsonObject>());}return catalogueFailure;}
 bool backupDevice(String& error){events.push_back("backup");if(!backupOk)error="Backup failed";return backupOk;}
 bool commitWrite(String&){events.push_back("commit");return true;}
 void writeProgress(uint32_t,uint32_t,uint32_t,void*){}

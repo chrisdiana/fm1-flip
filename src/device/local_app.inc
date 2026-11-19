@@ -695,7 +695,7 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
         if (index >= 0) {
             auto entry = readEntry(index);
             frame.eyebrow = standard(entry.author + " / " + entry.version);
-            frame.badge = entry.path.isEmpty() ? "CATALOGUE ONLY" : "DOWNLOADED";
+            frame.badge = entry.path.isEmpty() ? (entry.downloadable ? "NOT DOWNLOADED" : "MAKER INSTALLER") : "DOWNLOADED";
             frame.heading = standard(entry.name);
             frame.subtitle = standard(String(entry.beta ? "Beta" : "Non-beta") + " / chip " + gallery::status(gallery::compatibility(entry.chip.c_str(), transportFlashId())));
             detailOffset = std::min<size_t>(detailOffset, entry.description.length());

@@ -19,6 +19,9 @@ int main(int argc,char**argv){
  assert(argc==3);size_t expected=std::stoul(argv[2]);std::ifstream input(argv[1]);assert(input.good());String data((std::istreambuf_iterator<char>(input)),{});JsonDocument sourceDoc;assert(!deserializeJson(sourceDoc,data));size_t checkedPatterns=0;for(JsonObject item:sourceDoc["firmwares"].as<JsonArray>()){String pattern=item["assetPkg"]|"";if(pattern.empty())continue;String translated;int flags;assert(compileAssetPattern(pattern,translated,flags).empty());regex_t compiled;assert(regcomp(&compiled,translated.c_str(),flags)==0);regfree(&compiled);checkedPatterns++;}File raw(data),out("");
  auto error=normalize(raw,out,[]{return UINT64_MAX;});assert(error.empty());out.seek(0);size_t count=0,external=0;std::vector<uint32_t> offsets;
  error=scanCatalogue(out,[&](uint32_t offset,JsonObject e){count++;offsets.push_back(offset);external+=e["external_only"].as<bool>();});assert(error.empty());assert(count==expected);
+ out.seek(0);CatalogueMetadata metadata;
+ assert(scanCatalogue(out,[](uint32_t,JsonObject){},&metadata).empty());
+ assert(metadata.sourceUrl==HUB&&metadata.license=="CC-BY-4.0"&&!metadata.retrievedAt.empty());
  size_t sourceIndex=0;
  for(auto offset:offsets){out.seek(offset);JsonDocument entry;assert(!deserializeJson(entry,out));assert(entry["name"].is<const char*>());
   JsonObject original=sourceDoc["firmwares"][sourceIndex++];

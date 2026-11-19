@@ -38,4 +38,13 @@ inline String httpsFailure(int code, WiFiClientSecure& client, const String& url
  result+="Free RAM "+String(ESP.getFreeHeap())+", largest block "+String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))+" bytes.";
  return result;
 }
+inline String downloadFailure(int result, size_t written, int expected, WiFiClientSecure& client, const String& url) {
+ String message="Download interrupted: "+String((unsigned long)written);
+ message+=expected>=0?" of "+String(expected)+" bytes. ":" bytes (unknown total). ";
+ if(result<0)message+=HTTPClient::errorToString(result)+" ("+String(result)+"). ";
+ else message+="Response length mismatch. ";
+ message+=httpsFailure(result<0?result:0,client,url);
+ return message;
+}
+
 }

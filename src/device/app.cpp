@@ -39,7 +39,7 @@ namespace device { namespace {
 constexpr size_t MAX_ENTRIES=512, CATALOGUE_LIMIT=1024*1024, PACKAGE_LIMIT=4*1024*1024;
 uint64_t reserveBytes(){return transportBackupReserve();}
 struct Entry { String id,name,author,description,tags,version,hubUrl,sourceUrl,projectUrl,releaseUrl,license,packageUrl,sha256,path,chip,date,artworkUrl; uint32_t size=0,popularity=0; bool favorite=false,downloadable=false,beta=false,popularityKnown=false; };
-struct EntryIndex { uint32_t offset=0; String localPath;gallery::SortKey sort; };
+struct EntryIndex { uint32_t offset=0,packageKey=0; String localPath;gallery::SortKey sort; };
 EntryIndex entryIndex[MAX_ENTRIES]; size_t entryCount=0;JsonDocument favorites;uint32_t favoriteGeneration=0;
 fs::FS* disk=nullptr; bool storageReady=false; WebServer server(80); Preferences preferences;
 String catalogueSource="https://thefirmwarehub.com/catalog.json",catalogueAttribution="The Firmware Hub",catalogueLicense="CC-BY-4.0";
@@ -113,7 +113,7 @@ void networkJob(void*){
    // HTTPClient decodes chunk framing; raw getStreamPtr() does not.
    int received=http.writeToStream(&sink);
    if(!sink.error.empty()){ok=false;error=sink.error.c_str();if(sink.error=="Download storage write failed")error+=" at byte "+String((unsigned long)sink.bytesWritten())+", errno "+String(writeErrno)+" ("+(writeErrno?String(strerror(writeErrno)):String("driver supplied no error code"))+"), free storage "+String((unsigned long)freeSpace())+" bytes, heap "+String(ESP.getFreeHeap());}
-   else if(received<0||(expected>=0&&received!=expected)){ok=false;error="Download interrupted or incomplete";}
+   else if(received<0||(expected>=0&&received!=expected)){ok=false;error=downloadFailure(received,sink.bytesWritten(),expected,client,currentUrl);}
   }
   uint8_t digest[32];mbedtls_sha256_finish(&sha,digest);mbedtls_sha256_free(&sha);if(out)out.close();http.end();
   String hash;char hex[3];for(auto b:digest){snprintf(hex,sizeof(hex),"%02x",b);hash+=hex;}
@@ -130,22 +130,50 @@ void networkJob(void*){
 }
 bool startJob(const Job& next){if(locked())return false;job=next;jobCancel.store(false);jobBusy.store(true);jobStatus("Queued",next.path);if(xTaskCreate(networkJob,"fm1-import",12288,nullptr,1,nullptr)!=pdPASS){jobBusy.store(false);jobStatus("Error","Cannot allocate import worker");return false;}return true;}
 size_t matchCount();
+String downloadReason(const Entry& e);
 Entry readEntry(size_t index){
  Entry out;if(index>=entryCount)return out;auto& ref=entryIndex[index];
  if(ref.offset){File file=disk->open("/fm1/catalogue.json");if(!file||!file.seek(ref.offset))return out;JsonDocument doc;if(deserializeJson(doc,file))return out;JsonObject e=doc.as<JsonObject>();enrichBundledPresentation(e);out.artworkUrl=clipped(e["artworkUrl"]|"",768);out.popularityKnown=e["hubInstalls"].is<uint32_t>()&&e["hubInstalls"].as<uint32_t>()<=2147483647u;out.popularity=e["hubInstalls"]|0;out.id=e["id"]|"";out.name=clipped(e["name"]|"Unnamed",80);out.author=clipped(e["author"]|"",80);out.description=clipped(e["description"]|"",640);out.version=clipped(e["version"]|"",40);out.hubUrl=clipped(e["hubUrl"]|"",256);out.sourceUrl=clipped(e["sourceUrl"]|"",256);out.projectUrl=clipped(e["projectUrl"].is<const char*>()?e["projectUrl"].as<String>():e["sourceUrl"].as<String>(),256);out.releaseUrl=clipped(e["releaseUrl"]|"",256);out.license=clipped(e["license"]|"",96);out.sha256=clipped(e["sha256"]|"",64);out.chip=e["chip"]|"";out.date=e["date"]|"";out.beta=e["beta"]|false;out.size=e["size"]|0;out.downloadable=!e["external_only"].as<bool>()&&out.sha256.length()==64&&!out.releaseUrl.isEmpty();for(JsonVariant tag:e["tags"].as<JsonArray>()){if(out.tags.length()<160){if(out.tags.length())out.tags+=' ';out.tags+=clipped(tag.as<String>(),32);}}out.path=ref.localPath;
- }else{out.path=ref.localPath;String name=out.path.substring(out.path.lastIndexOf('/')+1);out.id="local-"+name;out.name=name;out.description="User-supplied package; integrity checked. Hardware compatibility unknown.";File f=disk->open(out.path);out.size=f?f.size():0;File side=disk->open(out.path+".json");JsonDocument metadata;if(side&&side.size()<8192&&!deserializeJson(metadata,side)){enrichBundledPresentation(metadata.as<JsonObject>());out.sha256=metadata["sha256"]|"";out.artworkUrl=clipped(metadata["artworkUrl"]|"",768);out.popularityKnown=metadata["hubInstalls"].is<uint32_t>()&&metadata["hubInstalls"].as<uint32_t>()<=2147483647u;out.popularity=metadata["hubInstalls"]|0;out.name=metadata["name"]|out.name;out.author=metadata["author"]|"";out.version=metadata["version"]|"";out.description=clipped(metadata["description"]|out.description,640);out.sourceUrl=metadata["sourceUrl"]|"";out.hubUrl=metadata["hubUrl"]|"";out.projectUrl=metadata["projectUrl"]|"";out.releaseUrl=metadata["releaseUrl"]|"";out.license=metadata["license"]|"";out.chip=metadata["chip"]|"";out.date=metadata["date"]|"";out.beta=metadata["beta"]|false;for(JsonVariant tag:metadata["tags"].as<JsonArray>()){if(out.tags.length()<160){if(out.tags.length())out.tags+=' ';out.tags+=clipped(tag.as<String>(),32);}}}}
+ }else{out.path=ref.localPath;String name=out.path.substring(out.path.lastIndexOf('/')+1);out.id="local-"+name;out.name=name;out.description="SD package; integrity and compatibility are checked before installation.";File f=disk->open(out.path);out.size=f?f.size():0;File side=disk->open(out.path+".json");JsonDocument metadata;if(side&&side.size()<8192&&!deserializeJson(metadata,side)){enrichBundledPresentation(metadata.as<JsonObject>());out.sha256=metadata["sha256"]|"";out.artworkUrl=clipped(metadata["artworkUrl"]|"",768);out.popularityKnown=metadata["hubInstalls"].is<uint32_t>()&&metadata["hubInstalls"].as<uint32_t>()<=2147483647u;out.popularity=metadata["hubInstalls"]|0;out.name=metadata["name"]|out.name;out.author=metadata["author"]|"";out.version=metadata["version"]|"";out.description=clipped(metadata["description"]|out.description,640);out.sourceUrl=metadata["sourceUrl"]|"";out.hubUrl=metadata["hubUrl"]|"";out.projectUrl=metadata["projectUrl"]|"";out.releaseUrl=metadata["releaseUrl"]|"";out.license=metadata["license"]|"";out.chip=metadata["chip"]|"";out.date=metadata["date"]|"";out.beta=metadata["beta"]|false;for(JsonVariant tag:metadata["tags"].as<JsonArray>()){if(out.tags.length()<160){if(out.tags.length())out.tags+=' ';out.tags+=clipped(tag.as<String>(),32);}}}}
  out.favorite=favorites[out.id].as<bool>();return out;
 }
 void addCategory(String tag){tag=clipped(tag,32);if(tag.isEmpty()||tag=="all")return;for(size_t i=0;i<categoryCount;i++)if(categories[i]==tag)return;if(categoryCount<24)categories[categoryCount++]=tag;}
+uint32_t packagePathKey(const String& path){uint32_t key=2166136261;for(unsigned char c:path){key^=c;key*=16777619;}return key;}
+String expectedPackagePath(uint32_t offset){
+ File file=disk->open("/fm1/catalogue.json",FILE_READ);if(!file||!file.seek(offset))return String();
+ JsonDocument doc;if(deserializeJson(doc,file))return String();
+ return "/fm1/packages/"+fileId(doc["id"].as<String>()+"|"+doc["sha256"].as<String>())+".fwsc";
+}
 void loadCatalogue(){
  if(!disk->exists("/fm1/catalogue.json")&&disk->exists("/fm1/catalogue.json.old"))disk->rename("/fm1/catalogue.json.old","/fm1/catalogue.json");
  if(!disk->exists("/fm1/catalogue.json"))ensureBundledCatalogue(*disk);
- for(size_t i=0;i<entryCount;i++)entryIndex[i].localPath="";entryCount=0;categoryCount=0;retrievedAt="unknown";File file=disk->open("/fm1/catalogue.json");
- String error=scanCatalogue(file,[&](uint32_t offset,JsonObject e){if(entryCount<MAX_ENTRIES){enrichBundledPresentation(e);entryIndex[entryCount].sort=gallery::sortKey(e["name"]|"",e["date"]|"",e["hubInstalls"]|0,e["hubInstalls"].is<uint32_t>());for(JsonVariant tag:e["tags"].as<JsonArray>())addCategory(tag.as<String>());entryIndex[entryCount].offset=offset;String packagePath="/fm1/packages/"+fileId(e["id"].as<String>()+"|"+e["sha256"].as<String>())+".fwsc";entryIndex[entryCount++].localPath=disk->exists(packagePath)?packagePath:String();}});file.close();if(!error.isEmpty()){entryCount=0;categoryCount=0;notice=error;}
- // Read only the small provenance fields; entries are filtered out before allocation.
- file=disk->open("/fm1/catalogue.json");JsonDocument meta,filter;filter["retrievedAt"]=true;filter["sourceUrl"]=true;filter["attribution"]=true;filter["license"]=true;if(file&&!deserializeJson(meta,file,DeserializationOption::Filter(filter))){retrievedAt=clipped(meta["retrievedAt"]|"unknown",64);catalogueSource=clipped(meta["sourceUrl"]|"",256);catalogueAttribution=clipped(meta["attribution"]|"",256);catalogueLicense=clipped(meta["license"]|"",64);}file.close();
- File dir=disk->open("/fm1/packages");for(File f=dir.openNextFile();f&&entryCount<MAX_ENTRIES;f=dir.openNextFile()){
- String name=f.name();if(f.isDirectory()||!name.endsWith(".fwsc"))continue;String path="/fm1/packages/"+name.substring(name.lastIndexOf('/')+1);bool found=false;for(size_t i=0;i<entryCount;i++)if(entryIndex[i].offset&&entryIndex[i].localPath==path){found=true;break;}if(found)continue;File side=disk->open(path+".json");JsonDocument info;if(side&&side.size()<8192&&!deserializeJson(info,side))enrichBundledPresentation(info.as<JsonObject>());if(!validate(path).isEmpty())continue;entryIndex[entryCount].sort=gallery::sortKey(info["name"]|name.c_str(),info["date"]|"",info["hubInstalls"]|0,info["hubInstalls"].is<uint32_t>());for(JsonVariant tag:info["tags"].as<JsonArray>())addCategory(tag.as<String>());entryIndex[entryCount].offset=0;entryIndex[entryCount++].localPath=path;
+ for(size_t i=0;i<entryCount;i++){entryIndex[i].localPath="";entryIndex[i].packageKey=0;}
+ entryCount=0;categoryCount=0;retrievedAt="unknown";File file=disk->open("/fm1/catalogue.json");CatalogueMetadata metadata;
+ String error=scanCatalogue(file,[&](uint32_t offset,JsonObject e){
+  if(entryCount>=MAX_ENTRIES)return;
+  enrichBundledPresentation(e);auto& ref=entryIndex[entryCount++];
+  ref.sort=gallery::sortKey(e["name"]|"",e["date"]|"",e["hubInstalls"]|0,e["hubInstalls"].is<uint32_t>());
+  for(JsonVariant tag:e["tags"].as<JsonArray>())addCategory(tag.as<String>());
+  ref.offset=offset;ref.localPath="";
+  ref.packageKey=packagePathKey("/fm1/packages/"+fileId(e["id"].as<String>()+"|"+e["sha256"].as<String>())+".fwsc");
+ },&metadata);file.close();
+ if(!error.isEmpty()){entryCount=0;categoryCount=0;notice=error;}
+ else {retrievedAt=metadata.retrievedAt.isEmpty()?String("unknown"):metadata.retrievedAt;catalogueSource=metadata.sourceUrl;catalogueAttribution=metadata.attribution;catalogueLicense=metadata.license;}
+ // One directory scan replaces a stat per catalogue entry. The compact key is
+ // only a lookup accelerator: confirm the complete path before linking a file.
+ File dir=disk->open("/fm1/packages");size_t scanned=0;
+ for(File f=dir.openNextFile();f&&scanned<2048;f=dir.openNextFile()){
+  ++scanned;String name=f.name();name=name.substring(name.lastIndexOf('/')+1);if(f.isDirectory()||name.startsWith(".")||!name.endsWith(".fwsc"))continue;
+  String path="/fm1/packages/"+name;uint32_t key=packagePathKey(path);bool found=false;
+  for(size_t i=0;i<entryCount;i++)if(entryIndex[i].offset&&entryIndex[i].packageKey==key&&expectedPackagePath(entryIndex[i].offset)==path){entryIndex[i].localPath=path;found=true;break;}
+  if(found||entryCount>=MAX_ENTRIES)continue;
+  File side=disk->open(path+".json");JsonDocument info;
+  if(side&&side.size()<8192&&!deserializeJson(info,side))enrichBundledPresentation(info.as<JsonObject>());
+  auto& ref=entryIndex[entryCount++];ref.sort=gallery::sortKey(info["name"]|name.c_str(),info["date"]|"",info["hubInstalls"]|0,info["hubInstalls"].is<uint32_t>());
+  for(JsonVariant tag:info["tags"].as<JsonArray>())addCategory(tag.as<String>());
+  // Packages are fully validated and hashed by installDevice before any write,
+  // rather than rereading every firmware image on each boot.
+  ref.offset=0;ref.packageKey=0;ref.localPath=path;
  }
  favoriteGeneration++;favorites.clear();deserializeJson(favorites,preferences.getString("favorites","{}"));dirty=true;
 }
@@ -223,7 +251,7 @@ void configureWeb(){
  size_t result[MAX_ENTRIES],total=0,offset=std::max<long>(0,server.arg("offset").toInt());String q=server.arg("q");q.toLowerCase();String mode=server.arg("filter"),category=server.arg("category"),release=server.arg("release"),compatibility=server.arg("compatibility");if(category.isEmpty())category="all";if(release.isEmpty())release="all";if(compatibility.isEmpty())compatibility="all";bool onlySaved=server.arg("view")=="saved"||mode=="saved";uint32_t flash=transportFlashId();
  for(size_t i=0;i<entryCount;i++){auto e=readEntry(i);String text=e.name+" "+e.author+" "+e.description+" "+e.tags;text.toLowerCase();if((onlySaved&&e.path.isEmpty())||(mode=="favorite"&&!e.favorite)||!filterMatches(e,category,release,compatibility,flash)||text.indexOf(q)<0)continue;result[total++]=i;}
  sortIndices(result,total,server.arg("sort"));JsonDocument d;d["schemaVersion"]=1;d["retrievedAt"]=retrievedAt;d["sourceUrl"]=catalogueSource;d["attribution"]=catalogueAttribution;d["license"]=catalogueLicense;d["targetFlashId"]=flash;auto cats=d["categories"].to<JsonArray>();for(size_t i=0;i<categoryCount;i++)cats.add(categories[i]);auto a=d["entries"].to<JsonArray>();
- for(size_t n=offset;n<total&&a.size()<16;n++){auto e=readEntry(result[n]);auto o=a.add<JsonObject>();o["id"]=e.id;o["name"]=e.name;o["author"]=e.author;o["description"]=e.description;o["version"]=e.version;o["hubUrl"]=e.hubUrl;o["sourceUrl"]=e.sourceUrl;o["projectUrl"]=e.projectUrl;o["releaseUrl"]=e.releaseUrl;o["license"]=e.license;o["downloadable"]=e.downloadable;o["size"]=e.size;o["saved"]=!e.path.isEmpty();o["favorite"]=e.favorite;o["tags"].to<JsonArray>().add(e.tags);o["chip"]=e.chip;o["beta"]=e.beta;o["date"]=e.date;o["compatibility"]=gallery::status(gallery::compatibility(e.chip.c_str(),flash));o["hardwareTested"]=false;o["artworkUrl"]=e.artworkUrl;if(e.popularityKnown)o["hubInstalls"]=e.popularity;else o["hubInstalls"]=nullptr;o["path"]=e.path;}
+ for(size_t n=offset;n<total&&a.size()<16;n++){auto e=readEntry(result[n]);auto o=a.add<JsonObject>();o["id"]=e.id;o["name"]=e.name;o["author"]=e.author;o["description"]=e.description;o["version"]=e.version;o["hubUrl"]=e.hubUrl;o["sourceUrl"]=e.sourceUrl;o["projectUrl"]=e.projectUrl;o["releaseUrl"]=e.releaseUrl;o["license"]=e.license;o["downloadable"]=e.downloadable;o["downloadReason"]=e.downloadable?String():downloadReason(e);o["size"]=e.size;o["saved"]=!e.path.isEmpty();o["favorite"]=e.favorite;o["tags"].to<JsonArray>().add(e.tags);o["chip"]=e.chip;o["beta"]=e.beta;o["date"]=e.date;o["compatibility"]=gallery::status(gallery::compatibility(e.chip.c_str(),flash));o["hardwareTested"]=false;o["artworkUrl"]=e.artworkUrl;if(e.popularityKnown)o["hubInstalls"]=e.popularity;else o["hubInstalls"]=nullptr;o["path"]=e.path;}
  d["total"]=total;d["offset"]=offset;d["limit"]=16;sendJson(d);});
  server.on("/api/favorite",HTTP_POST,[]{if(!storageReady||locked())return reject(409,"Storage busy");for(size_t i=0;i<entryCount;i++)if(readEntry(i).id==server.arg("id")){toggleFavorite(i);dirty=true;return reject(200,"Favorite updated");}reject(404,"Unknown entry");});
  server.on("/api/download",HTTP_POST,[]{if(!storageReady||locked())return reject(409,"Storage busy");for(size_t i=0;i<entryCount;i++)if(readEntry(i).id==server.arg("id")){auto e=readEntry(i);if(!e.downloadable||!e.path.isEmpty())return reject(400,"No supported maker package or already saved");String id=fileId(e.id+"|"+e.sha256);if(id.isEmpty())return reject(400,"Invalid package ID");Job next;next.path="/fm1/packages/"+id+".fwsc";next.download=true;next.id=e.id;if(requestNetworkJob(next))return reject(202,"Maker download queued; inspect import status for validation result");return reject(503,"Worker unavailable");}reject(404,"Unknown entry");});
@@ -250,7 +278,11 @@ void chooseAction();
 #include "local_app.inc"
 void selectStep(int amount){size_t n=matchCount();if(n){selected=(selected+n+amount)%n;dirty=true;}}
 void installConfirm(){if(locked())return;int idx=selectedIndex();if(idx<0){notice="Save a validated package first";return;}auto selectedEntry=readEntry(idx);if(selectedEntry.path.isEmpty()){notice="Save a validated package first";return;}String label=selectedEntry.name+" "+selectedEntry.version;if(!pendingAction.arm(fm1::ActionKind::Install,selectedEntry.path.c_str(),label.c_str()))return;confirmInstall=true;dirty=true;}
-void downloadSelected(){int i=selectedIndex();if(i<0||!storageReady||locked())return;auto e=readEntry(i);if(!e.downloadable){notice="External installer / no maker package";dirty=true;return;}if(!e.path.isEmpty()){notice="Already saved offline";dirty=true;return;}Job next;next.path="/fm1/packages/"+fileId(e.id+"|"+e.sha256)+".fwsc";next.download=true;next.id=e.id;requestNetworkJob(next);dirty=true;}
+String downloadReason(const Entry& e){
+ if(e.id=="jiant")return "JIANT requires its maker installer for additional components. See the project manual; restore official firmware first when coming from other custom firmware.";
+ return "No supported standalone maker package is available in this catalogue listing. Use the maker project or installer.";
+}
+void downloadSelected(){int i=selectedIndex();if(i<0||!storageReady||locked())return;auto e=readEntry(i);if(!e.downloadable){notice=downloadReason(e);dirty=true;return;}if(!e.path.isEmpty()){notice="Already saved offline";dirty=true;return;}Job next;next.path="/fm1/packages/"+fileId(e.id+"|"+e.sha256)+".fwsc";next.download=true;next.id=e.id;requestNetworkJob(next);dirty=true;}
 void refreshSelected(){if(!storageReady||locked())return;if(freeSpace()<reserveBytes()+64*1024){notice="Catalogue scratch reserve unavailable";dirty=true;return;}Job next;next.path="/fm1/catalogue.json";next.download=false;next.catalogue=true;next.refresh=true;requestNetworkJob(next);dirty=true;}
 void connectOrBackup(){if(locked())return;if(!storageReady){notice="Storage unavailable; Wi-Fi Files for setup";dirty=true;return;}auto s=transportStatus();if(s.connected)transportBackup();else transportConnect();dirty=true;}
 void chooseAction() {

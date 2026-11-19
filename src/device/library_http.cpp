@@ -35,7 +35,7 @@ void serveStoredPackages(WebServer& server,fs::FS& filesystem,const char* storag
  for(File file=directory.openNextFile();file&&scanned<2048;file=directory.openNextFile()) {
   if(file.isDirectory())continue;
   String filename=file.name();filename=filename.substring(filename.lastIndexOf('/')+1);
-  if(!filename.endsWith(".fwsc") || filename.indexOf("..")>=0)continue;
+  if(filename.startsWith(".") || !filename.endsWith(".fwsc") || filename.indexOf("..")>=0)continue;
   ++scanned;
   JsonDocument metadata,row;
   File sidecar=filesystem.open("/fm1/packages/"+filename+".json");

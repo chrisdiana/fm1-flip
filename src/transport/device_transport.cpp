@@ -373,24 +373,28 @@ bool installDevice(const char* path,String& error) {
  File sidecar=disk->open(selected+".json",FILE_READ);
  if(sidecar && sidecar.size()<=16384 && !deserializeJson(document,sidecar)) {
   String expected=document["sha256"]|"";
-  if(expected.length()==64 && expected.equalsIgnoreCase(hash)) {support=document["chip"]|"";matched=true;}
+  if(expected.length()==64 && expected.equalsIgnoreCase(hash)) {support=document["chip"]|"";matched=support=="new"||support=="old";}
  }
  sidecar.close();document.clear();
  if(!matched) {
   File catalogue=disk->open("/fm1/catalogue.json");
   String catalogueError=scanCatalogue(catalogue,[&](uint32_t,JsonObject entry) {
    String expected=entry["sha256"]|"";
-   if(expected.length()==64 && expected.equalsIgnoreCase(hash)) {support=entry["chip"]|"";matched=true;}
+   if(expected.length()==64 && expected.equalsIgnoreCase(hash)) {String candidate=entry["chip"]|"";if(candidate=="new"||candidate=="old"){support=candidate;matched=true;}}
   });
   catalogue.close();
-  if(!catalogueError.isEmpty()){error="Install requires valid catalogue compatibility metadata: "+catalogueError;return false;}
+  // Catalogue metadata is optional for local packages. Discard partial results
+  // from an invalid catalogue rather than treating them as compatibility evidence.
+  if(!catalogueError.isEmpty()){matched=false;support="";}
  }
- if(!matched || (support!="new" && support!="old")) {error="Package flash compatibility unknown. Keep saved; installation refused until supported evidence exists.";return false;}
+ // Unknown builds are allowed after the existing physical install confirmation.
+ // Package validation, live hardware identification and writer checks still apply.
+ if(!matched)update("Preflight","Unlisted or unknown chip support; checking package and connected FM-1");
  if(cancellation.load()==2){error="Install cancelled before connection; flash unchanged";return false;}
  if(!identifiedFm1 || !host::connected()) {
   if(!connectDevice(error))return false;
  }
- if(chip.flash_id==0xb36014 && support!="new") {error="Package supports older flash only; newer FM-1 flash detected";return false;}
+ if(chip.flash_id==0xb36014 && support=="old") {error="Package supports older flash only; newer FM-1 flash detected";return false;}
  // Retaining a full backup is an explicit Home > Create backup operation.
  // The direct writer keeps protected-region checks and sector readback in RAM.
  RomFlash flash;

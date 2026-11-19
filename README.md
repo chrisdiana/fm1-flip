@@ -130,7 +130,29 @@ Search and filters can remain active when switching between Discover and Downloa
 
 A catalogue listing is not a downloaded package. Open its firmware options and choose **Download package** first. The app downloads from the maker's release and checks package structure and supplied hashes. External-installer-only listings cannot be downloaded by the app. Older downloaded releases remain separately selectable after a catalogue update. Downloads support responses without a declared length, including chunked HTTP responses, and are capped at 4 MB. Storage keeps 64 KB of working space; no full-backup space is reserved.
 
-Downloaded packages can be installed offline. Installation still requires a recognized FM-1, valid package/hash/chip metadata, and physical confirmation. Unknown compatibility is refused. The writer preserves boot/calibration ranges, writes changed application sectors and checks readback. A reported MIDI boot identity is a further check; inspect actual FM-1 operation after restart.
+Downloaded packages can be installed offline. Installation requires a recognized FM-1, a valid FM-1 package and physical confirmation. Catalogue membership and JSON sidecars are optional. Unlisted builds can be installed with unknown chip support; a known older-flash-only build is still refused on newer FM-1 hardware. The writer preserves boot/calibration ranges, writes changed application sectors and checks readback. A reported MIDI boot identity is a further check; inspect actual FM-1 operation after restart.
+
+### Copy downloaded firmware to Cardputer's SD card
+
+Original Cardputer and Cardputer ADV can discover firmware packages copied from a computer:
+
+1. Power off the Cardputer before removing its FAT32 microSD card.
+2. On your computer, create `/fm1/packages/` at the card's root if needed, and copy your downloaded FM-1 **`.fwsc` packages** into it. Keep the original filenames; no special hashed name is required. Extract ZIP downloads first. Raw `.bin` files are not imported as firmware packages.
+3. Safely eject the card, reinsert it and restart FM-1 Flip. Packages are listed at startup; their contents are fully validated before installation, rather than reread on every boot.
+4. Open **Home → Downloaded**, select a package, open its options and choose **Install on FM-1**. Physically confirm the installation on the device.
+
+Example SD-card layout:
+
+```text
+/fm1/packages/patchwerk.fwsc
+/fm1/packages/another-firmware.fwsc
+```
+
+No `.json` sidecar or Hub listing is required. Copy any valid FM-1 `.fwsc` package into this folder and install it from **Downloaded**, using the existing physical confirmation. The installer uses an exact SHA-256 match in optional sidecar or catalogue metadata when available; filenames do not establish compatibility. Missing, outdated or invalid catalogue metadata does not prevent installing a local package. A known older-flash-only build is still refused on newer FM-1 hardware.
+
+For unlisted files, chip support and any special installation prerequisites are your responsibility: passing package checks does not guarantee the firmware will run on your FM-1 revision. Package structure, checksums, FM-1 model, protected flash regions and sector readback are still checked. Flip does not convert raw binaries or replace special multi-part maker installers. Use **Create backup** first if you want a recovery image; backups remain optional. Search and filters also apply to manually copied packages.
+
+Some Hub entries require a maker installer and cannot be downloaded or installed through Flip. JIANT FM is one example: its installer handles additional components. Follow its [installation manual](https://github.com/juanjiant-bit/JIANT/blob/main/docs/MANUAL.md), including restoring official firmware first when switching from other custom firmware.
 
 ### Optional backups and restore
 

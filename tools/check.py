@@ -16,6 +16,7 @@ with tempfile.TemporaryDirectory(prefix='fm1-check-') as tmp:
 # The fixture is generated offline; no Hub request is made by this check.
 if next((root / '.pio/libdeps').glob('*/ArduinoJson/src/ArduinoJson.h'), None):
     subprocess.run([sys.executable, 'tools/check_device_catalogue.py'], cwd=root, check=True)
+    subprocess.run([sys.executable, 'tools/check_library_boot.py'], cwd=root, check=True)
 else:
     print('Device catalogue parser test: install PlatformIO firmware dependencies, then run tools/check_device_catalogue.py', flush=True)
 
