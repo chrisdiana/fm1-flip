@@ -13,6 +13,7 @@
 #include <usb/usb_host.h>
 #include <esp_log.h>
 #include <soc/gpio_reg.h>
+#include <soc/io_mux_reg.h>
 #include <soc/rtc_cntl_reg.h>
 #include <soc/usb_serial_jtag_reg.h>
 #include <soc/usb_wrap_reg.h>
@@ -93,6 +94,52 @@ static void port_state(char *out, size_t n) {
              (unsigned long)(h & 1), (unsigned long)((h >> 2) & 1), (unsigned long)((h >> 12) & 1),
              (unsigned long)((h >> 10) & 1), (unsigned long)((h >> 11) & 1), (unsigned long)((h >> 17) & 3),
              (in >> 20) & 1, (in >> 19) & 1);
+}
+
+// Bus histograms: back-to-back samples counted as SE0 / J (D+ only) / K (D- only)
+// / SE1. A quiet empty port is all SE0, an idle full-speed device all J; a mix of
+// J and K with no device attached means the pair is being driven or is picking
+// up interference. The pad input buffers are enabled so GPIO_IN reflects the
+// pins (IE only; the pin function is not changed).
+static constexpr int HIST_SAMPLES = 20000;
+static constexpr int QUICK_SAMPLES = 2000;
+static char pre_install_hist[128];
+static std::atomic<int32_t> power_out5v_mv(-1), power_reg06(-1);
+static bool wait_unstable = false;
+bool last_wait_unstable() { return wait_unstable; }
+void set_power_sample(int32_t out5v_mv, int32_t pm1_reg06) {
+    power_out5v_mv.store(out5v_mv);
+    power_reg06.store(pm1_reg06);
+}
+static void log_power(Log log, unsigned long ms) {
+    int32_t r = power_reg06.load();
+    if (r < 0 && power_out5v_mv.load() < 0) return;  // no power controller on this board
+    log("%5lu ms power 5V out %ld mV, pm1 reg06 %02lX (5V out %s)", ms, (long)power_out5v_mv.load(),
+        (long)(r & 0xFF), r < 0 ? "?" : ((r & 0x08) ? "on" : "off"));
+}
+// Line state (as the OTG PHY sees it) J and K counts over a short window.
+static void quick_line_counts(uint32_t *j, uint32_t *k) {
+    *j = *k = 0;
+    for (int i = 0; i < QUICK_SAMPLES; i++) {
+        uint32_t s = (REG_READ(OTG_HPRT) >> 10) & 3;
+        if (s == 1) (*j)++;
+        else if (s == 2) (*k)++;
+    }
+}
+static void line_histogram(char *out, size_t n, const char *tag, bool with_line) {
+    PIN_INPUT_ENABLE(IO_MUX_GPIO19_REG);
+    PIN_INPUT_ENABLE(IO_MUX_GPIO20_REG);
+    uint32_t pad[4] = {}, line[4] = {};
+    for (int i = 0; i < HIST_SAMPLES; i++) {
+        uint32_t h = with_line ? REG_READ(OTG_HPRT) : 0, in = REG_READ(GPIO_IN_REG);
+        pad[((in >> 20) & 1) | (((in >> 19) & 1) << 1)]++;
+        line[(h >> 10) & 3]++;
+    }
+    int k = snprintf(out, n, "hist %s pads SE0 %lu J %lu K %lu SE1 %lu", tag, (unsigned long)pad[0],
+                     (unsigned long)pad[1], (unsigned long)pad[2], (unsigned long)pad[3]);
+    if (with_line && k > 0 && size_t(k) < n)
+        snprintf(out + k, n - k, " | line SE0 %lu J %lu K %lu SE1 %lu", (unsigned long)line[0],
+                 (unsigned long)line[1], (unsigned long)line[2], (unsigned long)line[3]);
 }
 
 // Host channels in use: characteristics (odd-frame bit masked), transfer size
@@ -304,6 +351,7 @@ bool start() {
     usb_host_config_t cfg = {};
     cfg.intr_flags = ESP_INTR_FLAG_LEVEL1;
     cfg.enum_filter_cb = enum_filter;
+    line_histogram(pre_install_hist, sizeof pre_install_hist, "pre-install", false);
     if (usb_host_install(&cfg) != ESP_OK) { stop(); return false; }
     installed = true;
     lib_running.store(true);
@@ -379,9 +427,40 @@ bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, cha
     char last[96] = "", now[96], last_ch[160] = "", now_ch[160];
     int ch_logged = 0;
     TickType_t last_fn = t0;
+    char hist[160];
     log_phy(log);
+    if (pre_install_hist[0]) { log("%s", pre_install_hist); pre_install_hist[0] = 0; }
+    line_histogram(hist, sizeof hist, "start", true);
+    log("%s", hist);
+    log_power(log, 0);
+    wait_unstable = false;
+    int32_t out5v_min = INT32_MAX, out5v_max = -1;
+    int unstable_checks = 0;
+    TickType_t last_check = t0;
     while (new_addr < 0) {
+        int32_t v = power_out5v_mv.load();
+        if (v >= 0) { out5v_min = v < out5v_min ? v : out5v_min; out5v_max = v > out5v_max ? v : out5v_max; }
         unsigned long ms = (xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
+        // With nothing connected the lines must sit still. Sustained J/K toggling
+        // while the root port reports no connection is an FM-1 browning out
+        // (low battery) or a noisy link: four bad checks in a row (~1 s) abort.
+        if (xTaskGetTickCount() - last_check >= pdMS_TO_TICKS(250)) {
+            last_check = xTaskGetTickCount();
+            uint32_t j, k;
+            quick_line_counts(&j, &k);
+            const uint32_t floor = QUICK_SAMPLES / 20;  // 5 %
+            if (!(REG_READ(OTG_HPRT) & 1) && j >= floor && k >= floor) unstable_checks++;
+            else unstable_checks = 0;
+            if (unstable_checks >= 4) {
+                log("%5lu ms lines toggling with no device (J %lu K %lu of %d); giving up", ms, (unsigned long)j,
+                    (unsigned long)k, QUICK_SAMPLES);
+                wait_unstable = true;
+                snprintf(err, errlen,
+                         "FM-1 USB signal unstable (lines toggling, no device). Its battery may be low: charge the "
+                         "FM-1, then retry.");
+                return false;
+            }
+        }
         port_state(now, sizeof now);
         if (strcmp(now, last) != 0) {
             log("%5lu ms %s", ms, now);
@@ -397,10 +476,18 @@ bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, cha
             last_fn = xTaskGetTickCount();
             log("%5lu ms frame %04lX gintsts %08lX haint %02lX", ms, (unsigned long)(REG_READ(0x60080408) & 0xFFFF),
                 (unsigned long)REG_READ(OTG_GINTSTS), (unsigned long)REG_READ(0x60080414));
+            line_histogram(hist, sizeof hist, "", true);
+            log("%5lu ms %s", ms, hist);
+            log_power(log, ms);
         }
         drain_idf_log(log);
         if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(timeout_ms)) {
             log_phy(log);
+            line_histogram(hist, sizeof hist, "timeout", true);
+            log("%s", hist);
+            log_power(log, ms);
+            if (out5v_max >= 0)
+                log("5V out min %ld max %ld mV over the wait", (long)out5v_min, (long)out5v_max);
             snprintf(err, errlen, "%s (%lu ms). %.88s",
                      port_attached() ? "USB detected; enumeration timed out" : "No USB attachment; check data cable/power",
                      (unsigned long)timeout_ms, now);

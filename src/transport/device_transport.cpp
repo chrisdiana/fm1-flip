@@ -9,12 +9,15 @@
 #include "jl.h"
 #include "uboot_host.h"
 #include "usbkey.h"
+#include "usb_bus.h"
 #include <fm1/package.hpp>
 #include <fm1/writer.hpp>
 #include <fm1/midi.hpp>
 #include <ArduinoJson.h>
 #include <mbedtls/sha256.h>
 #include <atomic>
+#include <algorithm>
+#include <vector>
 #include <time.h>
 
 namespace device {
@@ -34,6 +37,7 @@ String deviceRecordJson="{\"schemaVersion\":1,\"history\":[]}";
 constexpr size_t MaxDeviceRecordBytes=24576;
 constexpr size_t MaxHistoryEntries=16;
 String logPath;
+constexpr size_t MaxSessionLogs = 10;
 String lastLoggedStage;
 // 0 idle, 1 preflight, 2 stop requested, 3 writing (sector-boundary stop), 4 rebooting.
 std::atomic<uint8_t> cancellation{0};
@@ -196,6 +200,34 @@ bool queryFirmware(String& product,String& error) {
  }
  error="No valid running FM-1 identity response";return false;
 }
+// A USB session spans Connect through to disconnection: 5 V output on, pins and
+// PHY reset to a known state before the host starts, and returned to idle (5 V
+// off, USB-Serial-JTAG restored) when the session ends or fails.
+bool usbSession = false;
+// Session log only: teardown runs after the Error / Disconnected status is shown
+// and must not replace it on screen.
+void logOnly(const char* fmt, ...) {
+ char line[192]; va_list ap; va_start(ap,fmt); vsnprintf(line,sizeof line,fmt,ap); va_end(ap);
+ xSemaphoreTake(lock, portMAX_DELAY); const bool mayWriteLog=state.busy; xSemaphoreGive(lock);
+ if(!mayWriteLog || !logPath.length())return;
+ File log=disk->open(logPath,FILE_APPEND);
+ if(log && log.size()<65536) log.printf("%lu USB: %s\n",(unsigned long)millis(),line);
+}
+bool beginUsbSession(String& error) {
+ usbSession=true;
+ if(!usbbus::request_power(true)){error="5 V output did not switch on; restart M5 and retry";return false;}
+ usbbus::prepare_for_host(trace);
+ return true;
+}
+void endUsbSession() {
+ if(!usbSession && !hostStarted)return;
+ bool clean=true;
+ if(hostStarted) {clean=host::stop();if(clean)hostStarted=false;}
+ if(clean) usbbus::restore_idle(logOnly);
+ else logOnly("USB host cleanup incomplete; pins left as-is. Restart M5 before reconnecting.");
+ if(!usbbus::request_power(false)) logOnly("5 V output did not confirm switching off");
+ usbSession=false;
+}
 bool startAndWait(uint16_t& vid,uint16_t& pid,String& error) {
  char err[160]{};hostStarted=true;
  if(!host::start()){error="USB host initialization failed";return false;}
@@ -215,20 +247,25 @@ bool connectDevice(String& error) {
   hostStarted=false;
  }
  uint16_t vid=0,pid=0; char err[160]{};
- update("Connect","Looking for FM-1 USB. Leave it powered on and connected.");
+ if(!beginUsbSession(error))return false;
+ auto presence=usbbus::probe(trace);
+ if(presence==usbbus::Presence::Fault){error="Both USB data lines read high: check the cable or adapter for a short, then retry.";return false;}
+ if(presence==usbbus::Presence::Unstable){error="FM-1 USB signal unstable (pull-up dropping or lines toggling). Its battery may be low: charge the FM-1, then retry.";return false;}
+ update("Connect",presence==usbbus::Presence::Device?"FM-1 USB detected; enumerating.":"Looking for FM-1 USB. Leave it powered on and connected. A low FM-1 battery stops its USB.");
  bool enumerated=startAndWait(vid,pid,error);
  if(!enumerated) {
-  // A visible unsupported device is not a reason to drive raw recovery pulses.
-  if(vid || cancellation.load()==2 || host::port_attached())return false;
+  // A visible unsupported device is not a reason to drive raw recovery pulses,
+  // and neither is a bus that toggles with nothing attached.
+  if(vid || cancellation.load()==2 || host::port_attached() || host::last_wait_unstable())return false;
   if(!host::stop()){error="USB cleanup failed; restart M5 before reconnecting";return false;}
   hostStarted=false;
-  update("Boot-key connection","No USB device found. Keep cable attached; turn FM-1 OFF then ON now. Check its power source.");
+  update("Boot-key connection","No USB device found. Keep cable attached; turn FM-1 OFF then ON now. If its battery is low, charge it first.");
   usbkey::init();
   usbkey::KeyStats stats{};
   auto result=usbkey::send_key(&stats,20000,cancelled);
   if(result==usbkey::TIMEOUT || result==usbkey::CANCELLED) {
    usbkey::bus_float();
-   error=cancellation.load()==2?"Connection cancelled; flash unchanged":"No ROM boot-key response. Check data cable and FM-1 power, then retry.";
+   error=cancellation.load()==2?"Connection cancelled; flash unchanged":"No ROM boot-key response. Charge the FM-1 if its battery is low, check the data cable, then retry.";
    return false;
   }
   if(result!=usbkey::DP_HIGH_AT_START) {
@@ -238,6 +275,9 @@ bool connectDevice(String& error) {
   }
   if(cancellation.load()==2){usbkey::bus_float();error="Connection cancelled before USB host startup";return false;}
   usbkey::bus_float();
+  // The boot key drove the pins as GPIOs and routed D+ to the RMT: clear that
+  // before the USB host takes the PHY again.
+  usbbus::prepare_for_host(trace);
   if(!startAndWait(vid,pid,error))return false;
  }
  if(host::is_midi()) {
@@ -458,10 +498,24 @@ void worker(void*) {
   if(xQueueReceive(commands,&cmd,pdMS_TO_TICKS(1000))==pdTRUE) {
    if (!logPath.length()) {
     disk->mkdir("/fm1"); disk->mkdir("/fm1/logs");
-    for (uint32_t n=1;n<100000;n++) {
-     String candidate=String("/fm1/logs/session-")+n+".txt";
-     if (!disk->exists(candidate)) { logPath=candidate; break; }
+    // Keep the newest MaxSessionLogs-1 logs (each capped at 64 KB), then number
+    // the new one after the highest so ordering survives deletions.
+    std::vector<uint32_t> numbers;
+    File dir=disk->open("/fm1/logs");
+    for(File f=dir.openNextFile();f;f=dir.openNextFile()) {
+     String name=f.name();name=name.substring(name.lastIndexOf('/')+1);
+     if(!f.isDirectory() && name.startsWith("session-") && name.endsWith(".txt")) {
+      uint32_t n=name.substring(8,name.length()-4).toInt();
+      if(n)numbers.push_back(n);
+     }
     }
+    dir.close();
+    std::sort(numbers.begin(),numbers.end());
+    while(numbers.size()>=MaxSessionLogs) {
+     disk->remove(String("/fm1/logs/session-")+numbers.front()+".txt");
+     numbers.erase(numbers.begin());
+    }
+    logPath=String("/fm1/logs/session-")+(numbers.empty()?1:numbers.back()+1)+".txt";
    }
    String error; bool ok=false;
    if(cmd.kind==1) ok=connectDevice(error);
@@ -469,6 +523,8 @@ void worker(void*) {
    else if(cmd.kind==3) ok=installDevice(cmd.path,error);
    else if(cmd.kind==4) ok=restoreDevice(cmd.path,error);
    if(!ok) update(cancellation.load()==2?"Cancelled":"Error",error);
+   // Nothing left on the bus: stop the host, return the pins to idle, 5 V off.
+   if(!host::connected()) endUsbSession();
    cancellation.store(0);
    xSemaphoreTake(lock,portMAX_DELAY);
    state.busy=false;state.connected=identifiedFm1 && host::connected();
@@ -480,8 +536,10 @@ void worker(void*) {
    if(!host::connected() || !jl::ping()) {identifiedFm1=false;xSemaphoreTake(lock,portMAX_DELAY);
     state.connected=false;state.backupVerified=false;state.firmwareLive=false;state.mode=TransportMode::Disconnected;
     state.stage="Disconnected";state.detail="FM-1 connection lost; choose Connect to begin a new session";xSemaphoreGive(lock);
+    if(!host::connected()) endUsbSession();
    }
   } else if(!host::connected()) {
+   endUsbSession();
    xSemaphoreTake(lock,portMAX_DELAY);
    if(state.firmwareLive) {state.firmwareLive=false;state.mode=TransportMode::Disconnected;
     state.stage="Disconnected";state.detail="Last observed firmware retained; reconnect to verify the current FM-1";}
@@ -500,15 +558,32 @@ bool submit(uint8_t kind,const String& path="") {
  cancellation.store(0);xSemaphoreTake(lock,portMAX_DELAY);state.busy=false;xSemaphoreGive(lock);return false;
 }
 }
-void transportBegin(fs::FS& fs) {
- disk=&fs;lock=xSemaphoreCreateMutex();commands=xQueueCreate(1,sizeof(Command));
+namespace {
+void scanBaseline() {
+ bool found=false;
  File backups=disk->open("/fm1/backups");
  for(File file=backups.openNextFile();file;file=backups.openNextFile()) {
   String path=file.name();path=path.substring(path.lastIndexOf('/')+1);
   if(file.isDirectory() || !path.endsWith(".json") || file.size()>4096)continue;
   JsonDocument record;
-  if(!deserializeJson(record,file) && record["model"]=="FM-1" && record["verified"]==true && record["size"].as<uint32_t>()==FlashSize && disk->exists("/fm1/backups/"+path.substring(0,path.length()-5)+".bin")) {baselineExists.store(true);break;}
+  if(!deserializeJson(record,file) && record["model"]=="FM-1" && record["verified"]==true && record["size"].as<uint32_t>()==FlashSize && disk->exists("/fm1/backups/"+path.substring(0,path.length()-5)+".bin")) {found=true;break;}
  }
+ baselineExists.store(found);
+}
+}
+void transportStorageReset() {
+ // Storage was erased while idle: forget anything cached from the old files.
+ xSemaphoreTake(lock,portMAX_DELAY);
+ deviceRecordJson="{\"schemaVersion\":1,\"history\":[]}";
+ state.firmwareProduct="";state.firmwareKnown=false;state.lastBackupPath="";state.backupVerified=false;
+ logPath="";
+ xSemaphoreGive(lock);
+ scanBaseline();
+ loadDeviceRecord();
+}
+void transportBegin(fs::FS& fs) {
+ disk=&fs;lock=xSemaphoreCreateMutex();commands=xQueueCreate(1,sizeof(Command));
+ scanBaseline();
  loadDeviceRecord();
  state.stage="Idle";state.detail="USB power/wiring and hardware validation required before use.";
  if(!lock || !commands || xTaskCreatePinnedToCore(worker,"fm1_engine",24576,nullptr,2,&workerTask,1)!=pdPASS) {
