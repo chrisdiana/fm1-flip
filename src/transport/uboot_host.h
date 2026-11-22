@@ -20,10 +20,6 @@ bool start();
 bool stop();
 typedef void (*Log)(const char *fmt, ...);
 
-// The app's main task publishes the power chip's 5 V output reading (mV, -1 =
-// unknown) and its output-control register here, so the worker task can log
-// them without touching the I2C bus itself.
-void set_power_sample(int32_t out5v_mv, int32_t pm1_reg06);
 // True when the last wait_device() gave up because the lines toggled with no
 // device attached (an FM-1 browning out or a noisy connection). The boot-key
 // fallback is pointless then.

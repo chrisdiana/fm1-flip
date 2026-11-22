@@ -1,11 +1,12 @@
 #include "usb_bus.h"
+#include "crash_record.h"
 
-#include <atomic>
 #include <initializer_list>
 #include <stdio.h>
 #include <string.h>
 
 #include <driver/gpio.h>
+#include <esp_cpu.h>
 #include <esp_rom_gpio.h>
 #include <esp_rom_sys.h>
 #include <freertos/FreeRTOS.h>
@@ -88,12 +89,61 @@ void restore_idle(host::Log log) {
 
 const char *presence_name(Presence p) {
     switch (p) {
-    case Presence::Empty: return "no pull-up (empty port, FM-1 off, or battery too low for USB)";
+    case Presence::Empty: return "no pull-up (nothing attached, FM-1 off or still dark from a previous Connect, battery too low, or charge-only cable)";
     case Presence::Device: return "device pull-up present";
     case Presence::Unstable: return "unstable (lines toggling or pull-up dropping)";
     case Presence::Fault: return "both lines high (short or wiring fault)";
     }
     return "?";
+}
+
+// Diagnostic for a bus that is being driven when nothing should be: logs the
+// D+/D- edge timing (listen-only, pins stay inputs) so the pattern can be told
+// apart offline: serial data, full-speed packets, or a fixed-rate square wave.
+// Format: "cap N: <state><us> ...", state Z=SE0 J K 1=SE1, us = time spent in that
+// state before the next edge. Interrupts are held off for at most ~3 ms.
+static void capture_edges(host::Log log) {
+    static constexpr int MAX_EDGES = 400;
+    static uint32_t at[MAX_EDGES + 1];
+    static uint8_t st[MAX_EDGES + 1];
+    static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    const uint32_t per_us = esp_rom_get_cpu_ticks_per_us();
+    const uint32_t window = 3000 * per_us;
+    int n = 0;
+    portENTER_CRITICAL(&mux);
+    const uint32_t t0 = esp_cpu_get_cycle_count();
+    uint32_t in = REG_READ(GPIO_IN_REG);
+    uint8_t s = ((in >> PIN_DP) & 1) | (((in >> PIN_DM) & 1) << 1);
+    at[0] = t0;
+    st[0] = s;
+    uint32_t now = t0;
+    while (n < MAX_EDGES && now - t0 < window) {
+        in = REG_READ(GPIO_IN_REG);
+        now = esp_cpu_get_cycle_count();
+        const uint8_t v = ((in >> PIN_DP) & 1) | (((in >> PIN_DM) & 1) << 1);
+        if (v != s) {
+            s = v;
+            at[++n] = now;
+            st[n] = v;
+        }
+    }
+    portEXIT_CRITICAL(&mux);
+    static const char names[4] = {'Z', 'J', 'K', '1'};
+    log("cap: %d edges in %lu us (listen-only)", n, (unsigned long)((now - t0) / per_us));
+    char line[168];
+    size_t k = 0;
+    int first = 0;
+    for (int i = 0; i <= n; i++) {
+        const uint32_t end = i < n ? at[i + 1] : now;
+        const uint32_t tenths = (end - at[i]) * 10 / per_us;  // 0.1 us units
+        k += snprintf(line + k, sizeof line - k, "%c%lu.%lu ", names[st[i]], (unsigned long)(tenths / 10),
+                      (unsigned long)(tenths % 10));
+        if (k > sizeof line - 16 || i == n) {
+            log("cap %d: %s", first, line);
+            k = 0;
+            first = i + 1;
+        }
+    }
 }
 
 Presence probe(host::Log log) {
@@ -119,10 +169,12 @@ Presence probe(host::Log log) {
         last = s;
         esp_rom_delay_us(5);
     }
+    const uint32_t one_pct = N / 100, most = N * 95 / 100;
+    const bool odd = count[3] > one_pct || (count[1] > one_pct && count[2] > one_pct) || changes > 200;
+    if (odd) capture_edges(log);
     gpio_pulldown_dis(PIN_DP);
     gpio_pulldown_dis(PIN_DM);
 
-    const uint32_t one_pct = N / 100, most = N * 95 / 100;
     Presence p;
     if (count[3] > one_pct) p = Presence::Fault;
     // A healthy FM-1 showed ~35 K samples in short blips at attach (session-10),
@@ -136,26 +188,6 @@ Presence probe(host::Log log) {
     log("USB probe: %s (SE0 %lu J %lu K %lu SE1 %lu, %lu changes)", presence_name(p), (unsigned long)count[0],
         (unsigned long)count[1], (unsigned long)count[2], (unsigned long)count[3], (unsigned long)changes);
     return p;
-}
-
-static std::atomic<bool> controller(false), wanted(false), applied(false);
-
-void set_power_controller(bool available) { controller.store(available); }
-bool power_wanted() { return wanted.load(); }
-void power_applied(bool on) { applied.store(on); }
-
-bool request_power(bool on, uint32_t timeout_ms) {
-    if (!controller.load()) return true;
-    const bool change = applied.load() != on;
-    wanted.store(on);
-    TickType_t t0 = xTaskGetTickCount();
-    while (applied.load() != on) {
-        if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(timeout_ms)) return false;
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    // Give the rail, and an attached FM-1 that senses VBUS, time to settle.
-    if (change) vTaskDelay(pdMS_TO_TICKS(on ? 300 : 50));
-    return true;
 }
 
 }  // namespace usbbus

@@ -34,14 +34,4 @@ enum class Presence { Empty, Device, Unstable, Fault };
 Presence probe(host::Log log);
 const char *presence_name(Presence p);
 
-// 5 V output requests from the transport worker, applied by the main task (which
-// owns the I2C bus). Without a power controller (Cardputer), requests are no-ops.
-void set_power_controller(bool available);
-// Request the output on/off and wait until the main task has applied it plus a
-// settle delay. Returns false if the main task did not respond in time.
-bool request_power(bool on, uint32_t timeout_ms = 3000);
-// Main task: the requested state, and confirmation once it is applied.
-bool power_wanted();
-void power_applied(bool on);
-
 }  // namespace usbbus

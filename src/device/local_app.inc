@@ -988,6 +988,11 @@ void paintLocalTick() {
     }
     if (busy) wasImport = jobBusy.load();
     wasBusy = busy;
+    // An FM-1 that goes away between operations (cable pulled, switched off)
+    // is otherwise only visible in the transport state; say so on screen.
+    static bool wasConnected = false;
+    if (wasConnected && !transport.connected && !busy) { notice = "FM-1 disconnected"; dirty = true; }
+    wasConnected = transport.connected;
     int wifi = WiFi.status();
     if (wifi != previousWifi) {
         previousWifi = wifi;

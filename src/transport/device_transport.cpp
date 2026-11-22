@@ -10,6 +10,7 @@
 #include "uboot_host.h"
 #include "usbkey.h"
 #include "usb_bus.h"
+#include "crash_record.h"
 #include <fm1/package.hpp>
 #include <fm1/writer.hpp>
 #include <fm1/midi.hpp>
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <vector>
 #include <time.h>
+#include <esp_system.h>
 
 namespace device {
 namespace {
@@ -215,18 +217,19 @@ void logOnly(const char* fmt, ...) {
 }
 bool beginUsbSession(String& error) {
  usbSession=true;
- if(!usbbus::request_power(true)){error="5 V output did not switch on; restart M5 and retry";return false;}
  usbbus::prepare_for_host(trace);
  return true;
 }
 void endUsbSession() {
  if(!usbSession && !hostStarted)return;
+ crashrec::mark("session end: begin");
  bool clean=true;
  if(hostStarted) {clean=host::stop();if(clean)hostStarted=false;}
+ crashrec::mark("session end: restore pins");
  if(clean) usbbus::restore_idle(logOnly);
  else logOnly("USB host cleanup incomplete; pins left as-is. Restart M5 before reconnecting.");
- if(!usbbus::request_power(false)) logOnly("5 V output did not confirm switching off");
  usbSession=false;
+ crashrec::mark("session end: done");
 }
 bool startAndWait(uint16_t& vid,uint16_t& pid,String& error) {
  char err[160]{};hostStarted=true;
@@ -250,8 +253,8 @@ bool connectDevice(String& error) {
  if(!beginUsbSession(error))return false;
  auto presence=usbbus::probe(trace);
  if(presence==usbbus::Presence::Fault){error="Both USB data lines read high: check the cable or adapter for a short, then retry.";return false;}
- if(presence==usbbus::Presence::Unstable){error="FM-1 USB signal unstable (pull-up dropping or lines toggling). Its battery may be low: charge the FM-1, then retry.";return false;}
- update("Connect",presence==usbbus::Presence::Device?"FM-1 USB detected; enumerating.":"Looking for FM-1 USB. Leave it powered on and connected. A low FM-1 battery stops its USB.");
+ if(presence==usbbus::Presence::Unstable){error="The FM-1 is driving its USB lines instead of connecting. Switch it off and on, wait for its normal screen, then retry. If it repeats, charge it.";return false;}
+ update("Connect",presence==usbbus::Presence::Device?"FM-1 USB detected; enumerating.":"Looking for FM-1 USB. It must be on with its screen lit, on a data cable (not charge-only). A low FM-1 battery stops its USB.");
  bool enumerated=startAndWait(vid,pid,error);
  if(!enumerated) {
   // A visible unsupported device is not a reason to drive raw recovery pulses,
@@ -265,7 +268,7 @@ bool connectDevice(String& error) {
   auto result=usbkey::send_key(&stats,20000,cancelled);
   if(result==usbkey::TIMEOUT || result==usbkey::CANCELLED) {
    usbkey::bus_float();
-   error=cancellation.load()==2?"Connection cancelled; flash unchanged":"No ROM boot-key response. Charge the FM-1 if its battery is low, check the data cable, then retry.";
+   error=cancellation.load()==2?"Connection cancelled; flash unchanged":"No FM-1 response. Use a data cable (not charge-only), charge the FM-1, and if its screen is dark turn it off and on, then retry.";
    return false;
   }
   if(result!=usbkey::DP_HIGH_AT_START) {
@@ -492,6 +495,23 @@ bool restoreDevice(const char* path,String& error) {
  update("Restore boot confirmed",observedFirmware+"; "+String(report.changedSectors)+" application sectors restored; boot/calibration preserved.");
  return true;
 }
+const char* resetReasonName(esp_reset_reason_t r) {
+ switch(r) {
+  case ESP_RST_POWERON: return "power-on";
+  case ESP_RST_EXT: return "external pin";
+  case ESP_RST_SW: return "software restart";
+  case ESP_RST_PANIC: return "PANIC (crash)";
+  case ESP_RST_INT_WDT: return "interrupt watchdog";
+  case ESP_RST_TASK_WDT: return "task watchdog";
+  case ESP_RST_WDT: return "other watchdog";
+  case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+  case ESP_RST_BROWNOUT: return "BROWNOUT (supply dipped)";
+  case ESP_RST_SDIO: return "SDIO";
+  case ESP_RST_USB: return "USB peripheral";
+  case ESP_RST_JTAG: return "JTAG";
+  default: return "unknown";
+ }
+}
 void worker(void*) {
  Command cmd;
  for(;;) {
@@ -516,6 +536,14 @@ void worker(void*) {
      numbers.erase(numbers.begin());
     }
     logPath=String("/fm1/logs/session-")+(numbers.empty()?1:numbers.back()+1)+".txt";
+    // First log of this boot: record why the stick last restarted.
+    File boot=disk->open(logPath,FILE_APPEND);
+    if(boot){
+     boot.printf("%lu Boot: reset reason %s\n",(unsigned long)millis(),resetReasonName(esp_reset_reason()));
+     char crash[400];
+     if(crashrec::take(crash,sizeof crash))boot.printf("%s\n",crash);
+     boot.close();
+    }
    }
    String error; bool ok=false;
    if(cmd.kind==1) ok=connectDevice(error);
@@ -533,7 +561,8 @@ void worker(void*) {
    else if(!state.firmwareLive)state.mode=TransportMode::Unknown;
    xSemaphoreGive(lock);
   } else if(identifiedFm1) {
-   if(!host::connected() || !jl::ping()) {identifiedFm1=false;xSemaphoreTake(lock,portMAX_DELAY);
+   crashrec::mark("idle: checking FM-1 link");
+   if(!host::connected() || !jl::ping()) {crashrec::mark("idle: FM-1 link lost");identifiedFm1=false;xSemaphoreTake(lock,portMAX_DELAY);
     state.connected=false;state.backupVerified=false;state.firmwareLive=false;state.mode=TransportMode::Disconnected;
     state.stage="Disconnected";state.detail="FM-1 connection lost; choose Connect to begin a new session";xSemaphoreGive(lock);
     if(!host::connected()) endUsbSession();
@@ -582,6 +611,7 @@ void transportStorageReset() {
  loadDeviceRecord();
 }
 void transportBegin(fs::FS& fs) {
+ crashrec::install();
  disk=&fs;lock=xSemaphoreCreateMutex();commands=xQueueCreate(1,sizeof(Command));
  scanBaseline();
  loadDeviceRecord();

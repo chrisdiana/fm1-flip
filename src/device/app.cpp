@@ -5,8 +5,6 @@
 #include "device/local_controller.h"
 #include <algorithm>
 #include "device/transport.h"
-#include "uboot_host.h"
-#include "usb_bus.h"
 #include <vector>
 #include "device/web_asset.h"
 #include "device/trust.h"
@@ -393,15 +391,14 @@ void appSetup(){
  cfg.fallback_board=m5::board_t::board_M5Cardputer;
 #else
  cfg.fallback_board=m5::board_t::board_M5StickS3;
- // Grove/Hat 5 V (M5PM1 reg 0x06 bit 3) stays off except during an FM-1 USB
- // session; the transport requests it and appLoop applies it.
+ // Grove/Hat 5 V (M5PM1 reg 0x06 bit 3) stays off. It does not reach USB-C
+ // (VBUS there measures ~0 V either way); the FM-1 runs on its own battery.
  cfg.output_power=false;
 #endif
 #ifdef FM1_CARDPUTER
  M5Cardputer.begin(cfg,true);DISPLAY.setRotation(0); // Panel already has a 90-degree mounting offset.
 #else
  M5.begin(cfg);DISPLAY.setRotation(1);
- usbbus::set_power_controller(true);
 #endif
  beginLocalDisplay();
  jobMutex=xSemaphoreCreateMutex();preferences.begin("fm1-switcher",false);
@@ -437,21 +434,6 @@ void appLoop() {
     M5Cardputer.update();
 #else
     M5.update();
-    // 5 V output: apply the transport's on/off request. This task owns the internal I2C bus.
-    static bool ext5vOn = false;
-    const bool want5v = usbbus::power_wanted();
-    if (want5v != ext5vOn) { M5.Power.setExtOutput(want5v); ext5vOn = want5v; }
-    usbbus::power_applied(ext5vOn);
-    // Read-only samples for the USB host log: M5PM1 5VOUT (0x26/0x27, mV) and reg 0x06.
-    static uint32_t lastPowerSample = 0;
-    if (millis() - lastPowerSample >= 200) {
-        lastPowerSample = millis();
-        int32_t reg06 = -1, out5v = -1;
-        uint8_t value = 0, mv[2] = {};
-        if (M5.In_I2C.readRegister(0x6E, 0x06, &value, 1, 100000)) reg06 = value;
-        if (M5.In_I2C.readRegister(0x6E, 0x26, mv, 2, 100000)) out5v = (int32_t(mv[1]) << 8) | mv[0];
-        host::set_power_sample(out5v, reg06);
-    }
 #endif
     if(pendingWifiPower>=0 && int32_t(millis()-hotspotChangeAt)>=0){setWifiPower(pendingWifiPower!=0);pendingWifiPower=-1;}
     if(pendingHotspot>=0 && int32_t(millis()-hotspotChangeAt)>=0){setHotspot(pendingHotspot!=0);pendingHotspot=-1;dirty=true;}

@@ -1,5 +1,6 @@
 // USB host + Bulk-Only Transport, after M-Flasher's src/usb.rs (MIT).
 #include "uboot_host.h"
+#include "crash_record.h"
 #include <fm1/midi.hpp>
 
 #include <initializer_list>
@@ -35,6 +36,9 @@ static usb_device_handle_t dev;
 static std::atomic<usb_device_handle_t> claimed_device{nullptr};
 static std::atomic<int> new_addr{-1};
 static std::atomic<bool> gone{false};
+// Set while stop() tears down: the enumeration filter then refuses new devices,
+// which keeps a replugged device out while the old one is still being freed.
+static std::atomic<bool> stopping{false};
 static std::atomic<bool> lib_running{false}, client_running{false};
 static std::atomic<bool> lib_stop{false}, client_stop{false}, all_free{false};
 static std::atomic<bool> pending_out{false}, pending_in{false}, pending_ctl{false};
@@ -104,19 +108,8 @@ static void port_state(char *out, size_t n) {
 static constexpr int HIST_SAMPLES = 20000;
 static constexpr int QUICK_SAMPLES = 2000;
 static char pre_install_hist[128];
-static std::atomic<int32_t> power_out5v_mv(-1), power_reg06(-1);
 static bool wait_unstable = false;
 bool last_wait_unstable() { return wait_unstable; }
-void set_power_sample(int32_t out5v_mv, int32_t pm1_reg06) {
-    power_out5v_mv.store(out5v_mv);
-    power_reg06.store(pm1_reg06);
-}
-static void log_power(Log log, unsigned long ms) {
-    int32_t r = power_reg06.load();
-    if (r < 0 && power_out5v_mv.load() < 0) return;  // no power controller on this board
-    log("%5lu ms power 5V out %ld mV, pm1 reg06 %02lX (5V out %s)", ms, (long)power_out5v_mv.load(),
-        (long)(r & 0xFF), r < 0 ? "?" : ((r & 0x08) ? "on" : "off"));
-}
 // Line state (as the OTG PHY sees it) J and K counts over a short window.
 static void quick_line_counts(uint32_t *j, uint32_t *k) {
     *j = *k = 0;
@@ -179,6 +172,7 @@ static void lib_task(void *) {
 static void client_cb(const usb_host_client_event_msg_t *m, void *) {
     if (m->event == USB_HOST_CLIENT_EVENT_NEW_DEV) new_addr.store(m->new_dev.address);
     else if (m->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        crashrec::mark("client event: device gone");
         if (m->dev_gone.dev_hdl == claimed_device.load()) gone.store(true);
         // Preserve NEW_DEV if replacement enumeration races the old removal.
 
@@ -237,35 +231,48 @@ static bool close_device() {
 bool stop() {
     // This API belongs to the application worker, between complete commands.
     // A failed cleanup deliberately preserves resources still owned by USB.
+    crashrec::mark("host stop: begin");
     ready = false;
     if (cleanup_failed || executing.load()) { cleanup_failed = true; return false; }
     if (installed) {
-        // Disconnect before freeing devices so enumeration cannot add another.
-        // INVALID_STATE can mean the root port is already powered off.
-        esp_err_t power = usb_host_lib_set_root_port_power(false);
-        if (power != ESP_OK && power != ESP_ERR_INVALID_STATE) {
-            cleanup_failed = true; return false;
-        }
+        // Free every device BEFORE powering the root port off. ESP-IDF recycles
+        // the root port when the last device reference is freed and aborts
+        // (hub.c root_port_recycle) unless the port is still enabled or in
+        // recovery; powering it off first crashed on every cable unplug.
+        // Meanwhile the enumeration filter refuses any newly attached device.
+        stopping.store(true);
+        crashrec::mark("host stop: waiting for transfers");
         const TickType_t start = xTaskGetTickCount();
+        bool flushed = false;
         while (pending()) {
             // Device removal cancels bulk and EP0 transfers. Keep both event
             // tasks alive until every transfer callback has returned ownership.
+            // A device that is still attached is asked to cancel its bulk ones.
+            if (!flushed && dev && claimed && xTaskGetTickCount() - start >= pdMS_TO_TICKS(200)) {
+                for (uint8_t ep : {ep_in, ep_out})
+                    if (ep && usb_host_endpoint_halt(dev, ep) == ESP_OK) usb_host_endpoint_flush(dev, ep);
+                flushed = true;
+            }
             if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(CLEANUP_MS)) {
                 cleanup_failed = true; return false;
             }
             vTaskDelay(pdMS_TO_TICKS(5));
         }
+        crashrec::mark("host stop: close device");
         if (!close_device()) { cleanup_failed = true; return false; }
     }
+    crashrec::mark("host stop: client task");
     if (client_running.load()) {
         client_stop.store(true);
         usb_host_client_unblock(client);
         if (!await_false(client_running)) { cleanup_failed = true; return false; }
     }
     if (client) {
+        crashrec::mark("host stop: client deregister");
         if (usb_host_client_deregister(client) != ESP_OK) { cleanup_failed = true; return false; }
         client = nullptr;
     }
+    crashrec::mark("host stop: free transfers");
     // No callback can now reference these allocations or their semaphore.
     for (usb_transfer_t** transfer : {&x_out, &x_in, &x_ctl}) {
         if (*transfer && usb_host_transfer_free(*transfer) != ESP_OK) {
@@ -276,6 +283,7 @@ bool stop() {
     if (done) { vSemaphoreDelete(done); done = nullptr; }
     if (installed) {
         all_free.store(false);
+        crashrec::mark("host stop: free all devices");
         esp_err_t freed = usb_host_device_free_all();
         if (freed != ESP_OK && freed != ESP_ERR_NOT_FINISHED) { cleanup_failed = true; return false; }
         if (freed == ESP_ERR_NOT_FINISHED) {
@@ -292,11 +300,21 @@ bool stop() {
                 } else vTaskDelay(pdMS_TO_TICKS(5));
             }
         }
+        // Let the library task finish the port recycle requested by the last
+        // free (recover or disable) before the port changes state again.
+        if (lib_running.load()) vTaskDelay(pdMS_TO_TICKS(150));
+        crashrec::mark("host stop: root port power off");
+        // INVALID_STATE can mean the root port is already powered off.
+        const esp_err_t power = usb_host_lib_set_root_port_power(false);
+        if (power != ESP_OK && power != ESP_ERR_INVALID_STATE) { cleanup_failed = true; return false; }
+        if (lib_running.load()) vTaskDelay(pdMS_TO_TICKS(50));
+        crashrec::mark("host stop: library task");
         lib_stop.store(true);
         usb_host_lib_unblock();
         if (!await_false(lib_running)) { cleanup_failed = true; return false; }
         // Drain NO_CLIENTS or deferred free work even when free_all returned
         // immediately. Only this worker handles library events after joining.
+        crashrec::mark("host stop: uninstall");
         const TickType_t uninstallStart = xTaskGetTickCount();
         for (;;) {
             uint32_t flags = 0;
@@ -311,6 +329,8 @@ bool stop() {
         }
         installed = false;
     }
+    crashrec::mark("host stop: done");
+    stopping.store(false);
     if (previous_log) { esp_log_set_vprintf(previous_log); previous_log = nullptr; }
     new_addr.store(-1);
     gone.store(false);
@@ -325,7 +345,7 @@ bool stop() {
 // with that option ESP-IDF cancels every device unless a filter accepts it.
 static bool enum_filter(const usb_device_desc_t *, uint8_t *bConfigurationValue) {
     *bConfigurationValue = 1;
-    return true;
+    return !stopping.load();
 }
 
 bool start() {
@@ -336,6 +356,7 @@ bool start() {
     }
     new_addr.store(-1);
     gone.store(false);
+    stopping.store(false);
     io_fault.store(false);
     lib_stop.store(false);
     client_stop.store(false);
@@ -432,14 +453,10 @@ bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, cha
     if (pre_install_hist[0]) { log("%s", pre_install_hist); pre_install_hist[0] = 0; }
     line_histogram(hist, sizeof hist, "start", true);
     log("%s", hist);
-    log_power(log, 0);
     wait_unstable = false;
-    int32_t out5v_min = INT32_MAX, out5v_max = -1;
     int unstable_checks = 0;
     TickType_t last_check = t0;
     while (new_addr < 0) {
-        int32_t v = power_out5v_mv.load();
-        if (v >= 0) { out5v_min = v < out5v_min ? v : out5v_min; out5v_max = v > out5v_max ? v : out5v_max; }
         unsigned long ms = (xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
         // With nothing connected the lines must sit still. Sustained J/K toggling
         // while the root port reports no connection is an FM-1 browning out
@@ -456,8 +473,8 @@ bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, cha
                     (unsigned long)k, QUICK_SAMPLES);
                 wait_unstable = true;
                 snprintf(err, errlen,
-                         "FM-1 USB signal unstable (lines toggling, no device). Its battery may be low: charge the "
-                         "FM-1, then retry.");
+                         "The FM-1 dropped off USB and is driving its USB lines. Switch it off and on, wait for its "
+                         "normal screen, then retry. If it repeats, charge it.");
                 return false;
             }
         }
@@ -478,18 +495,14 @@ bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, cha
                 (unsigned long)REG_READ(OTG_GINTSTS), (unsigned long)REG_READ(0x60080414));
             line_histogram(hist, sizeof hist, "", true);
             log("%5lu ms %s", ms, hist);
-            log_power(log, ms);
         }
         drain_idf_log(log);
         if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(timeout_ms)) {
             log_phy(log);
             line_histogram(hist, sizeof hist, "timeout", true);
             log("%s", hist);
-            log_power(log, ms);
-            if (out5v_max >= 0)
-                log("5V out min %ld max %ld mV over the wait", (long)out5v_min, (long)out5v_max);
             snprintf(err, errlen, "%s (%lu ms). %.88s",
-                     port_attached() ? "USB detected; enumeration timed out" : "No USB attachment; check data cable/power",
+                     port_attached() ? "USB detected; enumeration timed out" : "No USB attachment; check FM-1 power and data cable",
                      (unsigned long)timeout_ms, now);
             return false;
         }
