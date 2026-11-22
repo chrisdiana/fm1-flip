@@ -18,8 +18,16 @@ See [M5Launcher installation and packaging](M5LAUNCHER.md) for details. The stan
 1. Open **Home → Wi-Fi setup** with **A**, select your 2.4 GHz network, enter its password with the character picker and choose **OK**. Use **SHOW / HIDE** in the edit actions to check the password. A small green header icon indicates a connection; failures appear as a message.
 2. Open **Discover**, select firmware with **A**, select again for options and choose **Download package**. To import a local `.fwsc`, use the [web interface](USAGE.md#optional-web-interface); no Hub listing or JSON sidecar is required.
 3. Open **Home → Downloaded**, select a saved package, open its options and choose **Install on FM-1**.
-4. Connect and power the FM-1 using a verified data cable and power arrangement. Review the firmware and hold **B for two seconds** to confirm. Install connects and identifies the FM-1 automatically.
+4. Switch the FM-1 on and connect it with a plain USB-C data cable (see [Cables](#cables)). Review the firmware and hold **B for two seconds** to confirm. Install connects and identifies the FM-1 automatically.
 5. Follow the progress screen. If requested, switch FM-1 **off, then on** with the cable attached for its boot-key connection. Keep power and USB connected while writing, then inspect FM-1 operation after restart.
+
+## Cables
+
+The StickS3 connects to the FM-1 with a USB-C to USB-C cable. Not every cable works:
+
+- **Use a plain, passive USB-C data cable.** Charge-only cables have no data wires, so the stick never sees the FM-1.
+- **Active cables do not work**, for example a Meta Quest Link cable. Their built-in electronics need power from the USB host, and the StickS3 does not supply power on its USB-C port. The FM-1 runs on its own battery, so it does not need power from the stick.
+- **Some ordinary-looking cables fail anyway.** If Connect reports *No USB attachment* while the FM-1 is on with its screen lit, try another cable before anything else.
 
 ## Button map
 

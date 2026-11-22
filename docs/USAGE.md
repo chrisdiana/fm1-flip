@@ -65,7 +65,8 @@ The browser can queue downloads and imports; installation uses handheld controls
 | No firmware in Downloaded | Download a supported package first; clear search and filters |
 | Download or refresh fails | Connect station Wi-Fi, allow clock synchronization, check storage and read **Last operation** |
 | Catalogue will not refresh again | Hub reads are throttled to once per 24 hours; cached browsing still works |
-| No USB attachment | Check the data cable and FM-1 power arrangement; follow the displayed off/on fallback if requested |
+| No USB attachment | Make sure the FM-1 is on with its screen lit and charged. Try another plain USB-C data cable: charge-only and active cables do not work, and some ordinary cables fail too (see [StickS3 cables](STICKS3.md#cables)). Follow the displayed off/on fallback if requested |
+| The FM-1 is driving its USB lines | The FM-1 was left in download mode by an interrupted session (cable pulled or M5 restarted). Switch the FM-1 off and on, wait for its normal screen, then retry |
 | USB detected; enumeration timed out | The root port detects a peer but has no usable USB device yet. Read Last operation and export the USB session log; record the FM-1 firmware and cable/power setup. No raw boot-key pulses are sent to this attached peer |
 | FM-1 screen goes dark during connection | It may be in ROM mode. Read the M5's connection stage/error; darkness alone does not establish loss of power |
 | Install is refused | Read **Last operation** for package, hash, chip compatibility or hardware identification details |
