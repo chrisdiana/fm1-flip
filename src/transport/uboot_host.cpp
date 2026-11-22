@@ -203,6 +203,19 @@ static bool await_false(const std::atomic<bool>& flag) {
     return true;
 }
 
+// Devices USBH still holds (open or not).
+static int device_count() {
+    uint8_t list[8];
+    int n = 0;
+    return usb_host_device_addr_list_fill(sizeof list, list, &n) == ESP_OK ? n : 0;
+}
+
+// True when a device is still physically connected and not yet reported gone.
+static bool device_on_bus() {
+    if (!(REG_READ(OTG_HPRT) & 1)) return false;
+    return dev ? !gone.load() : device_count() > 0;
+}
+
 static bool close_device() {
     if (!dev) return true;
     if (claimed) {
@@ -235,7 +248,8 @@ bool stop() {
     ready = false;
     if (cleanup_failed || executing.load()) { cleanup_failed = true; return false; }
     if (installed) {
-        // Free every device BEFORE powering the root port off. ESP-IDF recycles
+        // After an unplug, free every device BEFORE powering the root port off
+        // (a device still attached is handled below). ESP-IDF recycles
         // the root port when the last device reference is freed and aborts
         // (hub.c root_port_recycle) unless the port is still enabled or in
         // recovery; powering it off first crashed on every cable unplug.
@@ -257,6 +271,27 @@ bool stop() {
                 cleanup_failed = true; return false;
             }
             vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        // A device still on the bus (Connect again after an install, or after
+        // an unsupported device) must be reported gone by IDF before it is
+        // freed. Freeing it first disables the port but leaves the device
+        // attached; the root port power-off below then raises a disconnect
+        // for a device node that no longer exists, and hub.c aborts
+        // (dev_tree_node_dev_gone -> ESP_ERR_NOT_FOUND). Powering the port off
+        // first is IDF's own removal path: the hub reports the device gone
+        // and the later recycle finds the port in recovery.
+        vTaskDelay(pdMS_TO_TICKS(20));  // let an unplug already under way land first
+        if (lib_running.load() && device_on_bus()) {
+            crashrec::mark("host stop: power off attached device");
+            const esp_err_t power = usb_host_lib_set_root_port_power(false);
+            if (power != ESP_OK && power != ESP_ERR_INVALID_STATE) { cleanup_failed = true; return false; }
+            const TickType_t off = xTaskGetTickCount();
+            while (dev ? !gone.load() : device_count() > 0) {
+                // Without the removal event the free below would abort, so
+                // stop here instead; the user restarts the stick.
+                if (xTaskGetTickCount() - off >= pdMS_TO_TICKS(1000)) { cleanup_failed = true; return false; }
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
         }
         crashrec::mark("host stop: close device");
         if (!close_device()) { cleanup_failed = true; return false; }
