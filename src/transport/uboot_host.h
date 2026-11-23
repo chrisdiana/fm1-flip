@@ -20,6 +20,11 @@ bool start();
 bool stop();
 typedef void (*Log)(const char *fmt, ...);
 
+// True when the last wait_device() gave up because the lines toggled with no
+// device attached (an FM-1 browning out or a noisy connection). The boot-key
+// fallback is pointless then.
+bool last_wait_unstable();
+
 // Waits for a device to enumerate; fills vid/pid. Claims its bulk interface.
 // Logs the root port's state as it changes, and ESP-IDF's own USB messages.
 bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, char *err, size_t errlen);

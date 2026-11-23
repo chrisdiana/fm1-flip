@@ -1,5 +1,6 @@
 // USB host + Bulk-Only Transport, after M-Flasher's src/usb.rs (MIT).
 #include "uboot_host.h"
+#include "crash_record.h"
 #include <fm1/midi.hpp>
 
 #include <initializer_list>
@@ -13,6 +14,7 @@
 #include <usb/usb_host.h>
 #include <esp_log.h>
 #include <soc/gpio_reg.h>
+#include <soc/io_mux_reg.h>
 #include <soc/rtc_cntl_reg.h>
 #include <soc/usb_serial_jtag_reg.h>
 #include <soc/usb_wrap_reg.h>
@@ -34,6 +36,9 @@ static usb_device_handle_t dev;
 static std::atomic<usb_device_handle_t> claimed_device{nullptr};
 static std::atomic<int> new_addr{-1};
 static std::atomic<bool> gone{false};
+// Set while stop() tears down: the enumeration filter then refuses new devices,
+// which keeps a replugged device out while the old one is still being freed.
+static std::atomic<bool> stopping{false};
 static std::atomic<bool> lib_running{false}, client_running{false};
 static std::atomic<bool> lib_stop{false}, client_stop{false}, all_free{false};
 static std::atomic<bool> pending_out{false}, pending_in{false}, pending_ctl{false};
@@ -95,6 +100,41 @@ static void port_state(char *out, size_t n) {
              (in >> 20) & 1, (in >> 19) & 1);
 }
 
+// Bus histograms: back-to-back samples counted as SE0 / J (D+ only) / K (D- only)
+// / SE1. A quiet empty port is all SE0, an idle full-speed device all J; a mix of
+// J and K with no device attached means the pair is being driven or is picking
+// up interference. The pad input buffers are enabled so GPIO_IN reflects the
+// pins (IE only; the pin function is not changed).
+static constexpr int HIST_SAMPLES = 20000;
+static constexpr int QUICK_SAMPLES = 2000;
+static char pre_install_hist[128];
+static bool wait_unstable = false;
+bool last_wait_unstable() { return wait_unstable; }
+// Line state (as the OTG PHY sees it) J and K counts over a short window.
+static void quick_line_counts(uint32_t *j, uint32_t *k) {
+    *j = *k = 0;
+    for (int i = 0; i < QUICK_SAMPLES; i++) {
+        uint32_t s = (REG_READ(OTG_HPRT) >> 10) & 3;
+        if (s == 1) (*j)++;
+        else if (s == 2) (*k)++;
+    }
+}
+static void line_histogram(char *out, size_t n, const char *tag, bool with_line) {
+    PIN_INPUT_ENABLE(IO_MUX_GPIO19_REG);
+    PIN_INPUT_ENABLE(IO_MUX_GPIO20_REG);
+    uint32_t pad[4] = {}, line[4] = {};
+    for (int i = 0; i < HIST_SAMPLES; i++) {
+        uint32_t h = with_line ? REG_READ(OTG_HPRT) : 0, in = REG_READ(GPIO_IN_REG);
+        pad[((in >> 20) & 1) | (((in >> 19) & 1) << 1)]++;
+        line[(h >> 10) & 3]++;
+    }
+    int k = snprintf(out, n, "hist %s pads SE0 %lu J %lu K %lu SE1 %lu", tag, (unsigned long)pad[0],
+                     (unsigned long)pad[1], (unsigned long)pad[2], (unsigned long)pad[3]);
+    if (with_line && k > 0 && size_t(k) < n)
+        snprintf(out + k, n - k, " | line SE0 %lu J %lu K %lu SE1 %lu", (unsigned long)line[0],
+                 (unsigned long)line[1], (unsigned long)line[2], (unsigned long)line[3]);
+}
+
 // Host channels in use: characteristics (odd-frame bit masked), transfer size
 // and pending interrupts. Changes show whether a transfer moves at all.
 static void channel_state(char *out, size_t n) {
@@ -132,6 +172,7 @@ static void lib_task(void *) {
 static void client_cb(const usb_host_client_event_msg_t *m, void *) {
     if (m->event == USB_HOST_CLIENT_EVENT_NEW_DEV) new_addr.store(m->new_dev.address);
     else if (m->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        crashrec::mark("client event: device gone");
         if (m->dev_gone.dev_hdl == claimed_device.load()) gone.store(true);
         // Preserve NEW_DEV if replacement enumeration races the old removal.
 
@@ -162,6 +203,19 @@ static bool await_false(const std::atomic<bool>& flag) {
     return true;
 }
 
+// Devices USBH still holds (open or not).
+static int device_count() {
+    uint8_t list[8];
+    int n = 0;
+    return usb_host_device_addr_list_fill(sizeof list, list, &n) == ESP_OK ? n : 0;
+}
+
+// True when a device is still physically connected and not yet reported gone.
+static bool device_on_bus() {
+    if (!(REG_READ(OTG_HPRT) & 1)) return false;
+    return dev ? !gone.load() : device_count() > 0;
+}
+
 static bool close_device() {
     if (!dev) return true;
     if (claimed) {
@@ -190,35 +244,70 @@ static bool close_device() {
 bool stop() {
     // This API belongs to the application worker, between complete commands.
     // A failed cleanup deliberately preserves resources still owned by USB.
+    crashrec::mark("host stop: begin");
     ready = false;
     if (cleanup_failed || executing.load()) { cleanup_failed = true; return false; }
     if (installed) {
-        // Disconnect before freeing devices so enumeration cannot add another.
-        // INVALID_STATE can mean the root port is already powered off.
-        esp_err_t power = usb_host_lib_set_root_port_power(false);
-        if (power != ESP_OK && power != ESP_ERR_INVALID_STATE) {
-            cleanup_failed = true; return false;
-        }
+        // After an unplug, free every device BEFORE powering the root port off
+        // (a device still attached is handled below). ESP-IDF recycles
+        // the root port when the last device reference is freed and aborts
+        // (hub.c root_port_recycle) unless the port is still enabled or in
+        // recovery; powering it off first crashed on every cable unplug.
+        // Meanwhile the enumeration filter refuses any newly attached device.
+        stopping.store(true);
+        crashrec::mark("host stop: waiting for transfers");
         const TickType_t start = xTaskGetTickCount();
+        bool flushed = false;
         while (pending()) {
             // Device removal cancels bulk and EP0 transfers. Keep both event
             // tasks alive until every transfer callback has returned ownership.
+            // A device that is still attached is asked to cancel its bulk ones.
+            if (!flushed && dev && claimed && xTaskGetTickCount() - start >= pdMS_TO_TICKS(200)) {
+                for (uint8_t ep : {ep_in, ep_out})
+                    if (ep && usb_host_endpoint_halt(dev, ep) == ESP_OK) usb_host_endpoint_flush(dev, ep);
+                flushed = true;
+            }
             if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(CLEANUP_MS)) {
                 cleanup_failed = true; return false;
             }
             vTaskDelay(pdMS_TO_TICKS(5));
         }
+        // A device still on the bus (Connect again after an install, or after
+        // an unsupported device) must be reported gone by IDF before it is
+        // freed. Freeing it first disables the port but leaves the device
+        // attached; the root port power-off below then raises a disconnect
+        // for a device node that no longer exists, and hub.c aborts
+        // (dev_tree_node_dev_gone -> ESP_ERR_NOT_FOUND). Powering the port off
+        // first is IDF's own removal path: the hub reports the device gone
+        // and the later recycle finds the port in recovery.
+        vTaskDelay(pdMS_TO_TICKS(20));  // let an unplug already under way land first
+        if (lib_running.load() && device_on_bus()) {
+            crashrec::mark("host stop: power off attached device");
+            const esp_err_t power = usb_host_lib_set_root_port_power(false);
+            if (power != ESP_OK && power != ESP_ERR_INVALID_STATE) { cleanup_failed = true; return false; }
+            const TickType_t off = xTaskGetTickCount();
+            while (dev ? !gone.load() : device_count() > 0) {
+                // Without the removal event the free below would abort, so
+                // stop here instead; the user restarts the stick.
+                if (xTaskGetTickCount() - off >= pdMS_TO_TICKS(1000)) { cleanup_failed = true; return false; }
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+        }
+        crashrec::mark("host stop: close device");
         if (!close_device()) { cleanup_failed = true; return false; }
     }
+    crashrec::mark("host stop: client task");
     if (client_running.load()) {
         client_stop.store(true);
         usb_host_client_unblock(client);
         if (!await_false(client_running)) { cleanup_failed = true; return false; }
     }
     if (client) {
+        crashrec::mark("host stop: client deregister");
         if (usb_host_client_deregister(client) != ESP_OK) { cleanup_failed = true; return false; }
         client = nullptr;
     }
+    crashrec::mark("host stop: free transfers");
     // No callback can now reference these allocations or their semaphore.
     for (usb_transfer_t** transfer : {&x_out, &x_in, &x_ctl}) {
         if (*transfer && usb_host_transfer_free(*transfer) != ESP_OK) {
@@ -229,6 +318,7 @@ bool stop() {
     if (done) { vSemaphoreDelete(done); done = nullptr; }
     if (installed) {
         all_free.store(false);
+        crashrec::mark("host stop: free all devices");
         esp_err_t freed = usb_host_device_free_all();
         if (freed != ESP_OK && freed != ESP_ERR_NOT_FINISHED) { cleanup_failed = true; return false; }
         if (freed == ESP_ERR_NOT_FINISHED) {
@@ -245,11 +335,21 @@ bool stop() {
                 } else vTaskDelay(pdMS_TO_TICKS(5));
             }
         }
+        // Let the library task finish the port recycle requested by the last
+        // free (recover or disable) before the port changes state again.
+        if (lib_running.load()) vTaskDelay(pdMS_TO_TICKS(150));
+        crashrec::mark("host stop: root port power off");
+        // INVALID_STATE can mean the root port is already powered off.
+        const esp_err_t power = usb_host_lib_set_root_port_power(false);
+        if (power != ESP_OK && power != ESP_ERR_INVALID_STATE) { cleanup_failed = true; return false; }
+        if (lib_running.load()) vTaskDelay(pdMS_TO_TICKS(50));
+        crashrec::mark("host stop: library task");
         lib_stop.store(true);
         usb_host_lib_unblock();
         if (!await_false(lib_running)) { cleanup_failed = true; return false; }
         // Drain NO_CLIENTS or deferred free work even when free_all returned
         // immediately. Only this worker handles library events after joining.
+        crashrec::mark("host stop: uninstall");
         const TickType_t uninstallStart = xTaskGetTickCount();
         for (;;) {
             uint32_t flags = 0;
@@ -264,6 +364,8 @@ bool stop() {
         }
         installed = false;
     }
+    crashrec::mark("host stop: done");
+    stopping.store(false);
     if (previous_log) { esp_log_set_vprintf(previous_log); previous_log = nullptr; }
     new_addr.store(-1);
     gone.store(false);
@@ -278,7 +380,7 @@ bool stop() {
 // with that option ESP-IDF cancels every device unless a filter accepts it.
 static bool enum_filter(const usb_device_desc_t *, uint8_t *bConfigurationValue) {
     *bConfigurationValue = 1;
-    return true;
+    return !stopping.load();
 }
 
 bool start() {
@@ -289,6 +391,7 @@ bool start() {
     }
     new_addr.store(-1);
     gone.store(false);
+    stopping.store(false);
     io_fault.store(false);
     lib_stop.store(false);
     client_stop.store(false);
@@ -304,6 +407,7 @@ bool start() {
     usb_host_config_t cfg = {};
     cfg.intr_flags = ESP_INTR_FLAG_LEVEL1;
     cfg.enum_filter_cb = enum_filter;
+    line_histogram(pre_install_hist, sizeof pre_install_hist, "pre-install", false);
     if (usb_host_install(&cfg) != ESP_OK) { stop(); return false; }
     installed = true;
     lib_running.store(true);
@@ -379,9 +483,36 @@ bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, cha
     char last[96] = "", now[96], last_ch[160] = "", now_ch[160];
     int ch_logged = 0;
     TickType_t last_fn = t0;
+    char hist[160];
     log_phy(log);
+    if (pre_install_hist[0]) { log("%s", pre_install_hist); pre_install_hist[0] = 0; }
+    line_histogram(hist, sizeof hist, "start", true);
+    log("%s", hist);
+    wait_unstable = false;
+    int unstable_checks = 0;
+    TickType_t last_check = t0;
     while (new_addr < 0) {
         unsigned long ms = (xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
+        // With nothing connected the lines must sit still. Sustained J/K toggling
+        // while the root port reports no connection is an FM-1 browning out
+        // (low battery) or a noisy link: four bad checks in a row (~1 s) abort.
+        if (xTaskGetTickCount() - last_check >= pdMS_TO_TICKS(250)) {
+            last_check = xTaskGetTickCount();
+            uint32_t j, k;
+            quick_line_counts(&j, &k);
+            const uint32_t floor = QUICK_SAMPLES / 20;  // 5 %
+            if (!(REG_READ(OTG_HPRT) & 1) && j >= floor && k >= floor) unstable_checks++;
+            else unstable_checks = 0;
+            if (unstable_checks >= 4) {
+                log("%5lu ms lines toggling with no device (J %lu K %lu of %d); giving up", ms, (unsigned long)j,
+                    (unsigned long)k, QUICK_SAMPLES);
+                wait_unstable = true;
+                snprintf(err, errlen,
+                         "The FM-1 dropped off USB and is driving its USB lines. Switch it off and on, wait for its "
+                         "normal screen, then retry. If it repeats, charge it.");
+                return false;
+            }
+        }
         port_state(now, sizeof now);
         if (strcmp(now, last) != 0) {
             log("%5lu ms %s", ms, now);
@@ -397,12 +528,16 @@ bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, cha
             last_fn = xTaskGetTickCount();
             log("%5lu ms frame %04lX gintsts %08lX haint %02lX", ms, (unsigned long)(REG_READ(0x60080408) & 0xFFFF),
                 (unsigned long)REG_READ(OTG_GINTSTS), (unsigned long)REG_READ(0x60080414));
+            line_histogram(hist, sizeof hist, "", true);
+            log("%5lu ms %s", ms, hist);
         }
         drain_idf_log(log);
         if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(timeout_ms)) {
             log_phy(log);
+            line_histogram(hist, sizeof hist, "timeout", true);
+            log("%s", hist);
             snprintf(err, errlen, "%s (%lu ms). %.88s",
-                     port_attached() ? "USB detected; enumeration timed out" : "No USB attachment; check data cable/power",
+                     port_attached() ? "USB detected; enumeration timed out" : "No USB attachment; check FM-1 power and data cable",
                      (unsigned long)timeout_ms, now);
             return false;
         }

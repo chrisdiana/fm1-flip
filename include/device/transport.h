@@ -30,6 +30,9 @@ bool transportCancel();
 bool transportCanCancel();
 bool transportCanDeleteBackup(const String& path);
 bool transportDeleteBackup(const String& path);
+// Call after storage was erased (transport idle): drops cached device record,
+// backup baseline and the session log path.
+void transportStorageReset();
 bool transportRestore(const String& path);
 uint32_t transportStackWatermark();
 bool transportInstall(const String& path);

@@ -3,10 +3,12 @@
 namespace ui = device::presentation;
 namespace local = device::local;
 
-enum class LocalPage { Home, Wifi, Backups, BackupActions, History, Setup, WebUi, Info };
-enum class LocalConfirmation { None, Format, DeleteBackup };
+enum class LocalPage { Home, Wifi, Backups, BackupActions, History, Setup, WebUi, Info, Storage, StoragePackages };
+enum class LocalConfirmation { None, Format, DeleteBackup, DeletePackage, DeleteLogs, EraseAll };
 struct WifiChoice { String ssid; int rssi; bool open; };
 struct BackupChoice { String path; uint32_t size; uint32_t number; };
+struct StorageGroup { uint32_t files = 0, bins = 0; uint64_t bytes = 0; };
+struct PackageChoice { String path; uint32_t size; String label; };
 
 // M5Cardputer.Display is a reference initialized by another global constructor.
 // The underlying M5.Display object has a stable address before any constructors.
@@ -29,6 +31,11 @@ String localConfirmationPath, localInfoTitle, localInfoBody;
 std::vector<WifiChoice> wifiChoices;
 std::vector<BackupChoice> backupChoices;
 std::vector<ui::Row> historyChoices;
+std::vector<PackageChoice> packageChoices;
+StorageGroup storagePackages, storageBackups, storageLogs, storageOther;
+size_t storageSelected = 0, packageSelected = 0;
+bool backupsFromStorage = false;
+constexpr size_t STORAGE_ROWS = 6;
 size_t localInfoOffset = 0;
 size_t wifiSelected = 0, backupSelected = 0, backupAction = 0, historySelected = 0;
 uint8_t mainTab = 0;
@@ -250,6 +257,145 @@ String backupLabel(const BackupChoice& backup) {
     return backup.path.substring(backup.path.lastIndexOf('/') + 1);
 }
 
+void armLocalConfirmation(LocalConfirmation action, const String& path);
+
+// Files directly in dirName (not subdirectories). Collects saved .fwsc packages
+// when asked; their .json metadata counts towards the bytes.
+StorageGroup scanFiles(const char* dirName, std::vector<PackageChoice>* packages = nullptr) {
+    StorageGroup group;
+    File dir = disk->open(dirName);
+    if (!dir || !dir.isDirectory()) return group;
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        if (f.isDirectory()) continue;
+        String name = f.name();
+        name = name.substring(name.lastIndexOf('/') + 1);
+        group.files++;
+        if (name.endsWith(".bin")) group.bins++;
+        group.bytes += f.size();
+        if (packages && name.endsWith(".fwsc") && packages->size() < 64)
+            packages->push_back({String(dirName) + "/" + name, uint32_t(f.size()), name});
+    }
+    return group;
+}
+
+void scanStorage() {
+    packageChoices.clear();
+    storagePackages = scanFiles("/fm1/packages", &packageChoices);
+    storageBackups = scanFiles("/fm1/backups");
+    storageLogs = scanFiles("/fm1/logs");
+    storageOther = scanFiles("/fm1");  // catalogue, FM-1 record, CA bundle
+    for (auto& package : packageChoices)
+        for (size_t i = 0; i < entryCount; i++)
+            if (entryIndex[i].localPath == package.path) {
+                Entry entry = readEntry(i);
+                package.label = entry.name + " " + entry.version;
+                break;
+            }
+}
+
+String groupSummary(const StorageGroup& group, uint32_t count, const char* noun) {
+    return String((unsigned long)count) + " " + noun + " / " + readableBytes(group.bytes);
+}
+
+void openStorage(bool reset = false) {
+    if (!storageReady) { localPage = LocalPage::Setup; actionMenu = false; dirty = true; return; }
+    if (locked()) { notice = "Storage busy; finish the current operation first"; dirty = true; return; }
+    scanStorage();
+    if (reset) storageSelected = 0;
+    backupsFromStorage = false;
+    localPage = LocalPage::Storage;
+    actionMenu = false;
+    dirty = true;
+}
+
+void openPackages() {
+    if (locked()) { notice = "Storage busy"; dirty = true; return; }
+    scanStorage();
+    packageSelected = 0;
+    localPage = LocalPage::StoragePackages;
+    actionMenu = false;
+    dirty = true;
+}
+
+String storageDetails() {
+    const uint64_t total = totalSpace(), free = freeSpace();
+    return readableBytes(free) + " free of " + readableBytes(total) + ". Firmware: " +
+           groupSummary(storagePackages, packageChoices.size(), "packages") + ". Backups: " +
+           groupSummary(storageBackups, storageBackups.bins, "backups") +
+           ". Logs: " + groupSummary(storageLogs, storageLogs.files, "files") +
+           " (newest 10 kept). Catalogue, FM-1 record and CA bundle: " + readableBytes(storageOther.bytes) + ".";
+}
+
+void chooseStorageAction() {
+    switch (storageSelected) {
+    case 0: showLocalInfo("Storage", storageDetails()); break;
+    case 1: openPackages(); break;
+    case 2:
+        openBackups();
+        backupsFromStorage = localPage == LocalPage::Backups;
+        break;
+    case 3:
+        if (!storageLogs.files) { notice = "No session logs"; dirty = true; }
+        else armLocalConfirmation(LocalConfirmation::DeleteLogs, "");
+        break;
+    case 4: armLocalConfirmation(LocalConfirmation::EraseAll, ""); break;
+    default:
+#ifdef FM1_CARDPUTER
+        showLocalInfo("Export files", "Power down and copy /fm1 from the SD card, or use Home > Web UI / hotspot > Files in a browser.");
+#else
+        showLocalInfo("Export files", "Join the FM1-Flip hotspot (or your Wi-Fi), open the device address in a browser and use Files > Export.");
+#endif
+        break;
+    }
+}
+
+bool removeLogs() {
+    std::vector<String> logs;
+    File dir = disk->open("/fm1/logs");
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        String name = f.name();
+        if (!f.isDirectory()) logs.push_back("/fm1/logs/" + name.substring(name.lastIndexOf('/') + 1));
+    }
+    dir.close();
+    bool ok = true;
+    for (const auto& path : logs) ok = disk->remove(path) && ok;
+    return ok;
+}
+
+#ifdef FM1_CARDPUTER
+// The SD card itself is never formatted; only the app's /fm1 tree is removed.
+bool removeTree(const String& path) {
+    std::vector<String> files, dirs;
+    File dir = disk->open(path);
+    if (!dir || !dir.isDirectory()) return false;
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        String name = f.name();
+        String child = path + "/" + name.substring(name.lastIndexOf('/') + 1);
+        (f.isDirectory() ? dirs : files).push_back(child);
+    }
+    dir.close();
+    bool ok = true;
+    for (const auto& file : files) ok = disk->remove(file) && ok;
+    for (const auto& sub : dirs) ok = removeTree(sub) && disk->rmdir(sub) && ok;
+    return ok;
+}
+#endif
+
+bool eraseAllStorage() {
+#ifdef FM1_CARDPUTER
+    bool ok = removeTree("/fm1");
+#else
+    LittleFS.end();
+    bool ok = LittleFS.format() && LittleFS.begin(false);
+    storageReady = ok;
+#endif
+    if (storageReady)
+        for (auto path : {"/fm1", "/fm1/packages", "/fm1/backups", "/fm1/logs"}) disk->mkdir(path);
+    loadCatalogue();
+    transportStorageReset();
+    return ok;
+}
+
 void openHistory() {
     historyChoices.clear();
     JsonDocument record;
@@ -320,6 +466,29 @@ void completeLocalConfirmation() {
             openBackups();
             notice = "Backup deleted";
         } else notice = "Backup unavailable or operation in progress";
+    } else if (localConfirmation == LocalConfirmation::DeletePackage) {
+        String path = localConfirmationPath;
+        if (path.startsWith("/fm1/packages/") && path.endsWith(".fwsc") && safePath(path) && disk->remove(path)) {
+            disk->remove(path + ".json");
+            loadCatalogue();
+            localConfirmation = LocalConfirmation::None;
+            localReview = false;
+            openPackages();
+            notice = "Firmware package deleted";
+        } else notice = "Cannot delete package";
+    } else if (localConfirmation == LocalConfirmation::DeleteLogs) {
+        bool ok = removeLogs();
+        localConfirmation = LocalConfirmation::None;
+        localReview = false;
+        openStorage();
+        notice = ok ? "Session logs deleted" : "Some logs could not be deleted";
+    } else if (localConfirmation == LocalConfirmation::EraseAll) {
+        bool ok = eraseAllStorage();
+        localConfirmation = LocalConfirmation::None;
+        localReview = false;
+        if (storageReady) openStorage(true);
+        else localPage = LocalPage::Setup;
+        notice = ok ? "Storage erased" : "Storage erase failed";
     }
     localConfirmation = LocalConfirmation::None;
     localReview = false;
@@ -363,6 +532,8 @@ void backLocal() {
         homeMenu = infoReturnHome;
     }
     else if (localPage == LocalPage::BackupActions) localPage = LocalPage::Backups;
+    else if (localPage == LocalPage::StoragePackages) openStorage();
+    else if (localPage == LocalPage::Backups && backupsFromStorage) openStorage();
     else if (localPage == LocalPage::History) { localPage = LocalPage::Home; mainTab = 2; }
     else if (localPage != LocalPage::Home) showHome();
     else if (detail) detail = false;
@@ -395,6 +566,8 @@ void moveLocal(int direction) {
     else if (localPage == LocalPage::Backups) step(backupSelected, backupChoices.size());
     else if (localPage == LocalPage::WebUi) step(hotspotSelected,3);
     else if (localPage == LocalPage::BackupActions) step(backupAction, 3);
+    else if (localPage == LocalPage::Storage) step(storageSelected, STORAGE_ROWS);
+    else if (localPage == LocalPage::StoragePackages) step(packageSelected, packageChoices.size());
     else if (localPage == LocalPage::History) step(historySelected, historyChoices.size());
     else if (localPage == LocalPage::Info) {
         if (direction > 0) localInfoOffset = localInfoOffset + 60 < localInfoBody.length() ? localInfoOffset + 60 : 0;
@@ -433,6 +606,11 @@ void activateLocal() {
         localPage = LocalPage::BackupActions;
         backupAction = 0;
     } else if (localPage == LocalPage::BackupActions) chooseBackupAction();
+    else if (localPage == LocalPage::Storage) chooseStorageAction();
+    else if (localPage == LocalPage::StoragePackages) {
+        if (packageSelected < packageChoices.size())
+            armLocalConfirmation(LocalConfirmation::DeletePackage, packageChoices[packageSelected].path);
+    }
     else if (localPage == LocalPage::History) backLocal();
     else if (localPage == LocalPage::Setup) {
 #ifndef FM1_CARDPUTER
@@ -465,7 +643,7 @@ String actionSubtitle(size_t index) {
     case 13: return compatibilityFilter + " / maker declaration";
     case 14: return sortOrder == "popular" ? "Most downloaded on the Hub" : sortOrder;
     case 15: return favoritesOnly ? "Showing favorites" : "Showing all entries";
-    case 16: return storageReady ? readableBytes(freeSpace()) + " free" : "Initialize storage explicitly";
+    case 16: return storageReady ? readableBytes(freeSpace()) + " free of " + readableBytes(totalSpace()) : "Initialize storage explicitly";
     case 17: return apEnabled ? "Hotspot ON / browser access" : "Hotspot OFF / enable when needed";
     case 18: return "Detailed result of the last operation";
     case 19: return "FM-1 identity, separate from downloads";
@@ -521,6 +699,22 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
         } else if (localConfirmation == LocalConfirmation::Format) {
             frame.heading = "Initialize storage?";
             frame.body = "Erases the internal filesystem, including any saved packages. Release, then hold to initialize.";
+        } else if (localConfirmation == LocalConfirmation::DeletePackage) {
+            frame.heading = "Delete firmware?";
+            frame.subtitle = standard(localConfirmationPath.substring(localConfirmationPath.lastIndexOf('/') + 1));
+            for (const auto& package : packageChoices)
+                if (package.path == localConfirmationPath) frame.subtitle = standard(package.label);
+            frame.body = "Removes this downloaded package. Download it again from the Hub if you need it later.";
+        } else if (localConfirmation == LocalConfirmation::DeleteLogs) {
+            frame.heading = "Delete session logs?";
+            frame.body = "Removes all connect / backup session logs. Backups and firmware are kept.";
+        } else if (localConfirmation == LocalConfirmation::EraseAll) {
+            frame.heading = "Erase all storage?";
+#ifdef FM1_CARDPUTER
+            frame.body = "Deletes /fm1 on the SD card: every backup, downloaded firmware, log, catalogue and FM-1 record. Export backups first.";
+#else
+            frame.body = "Formats internal storage: every backup, downloaded firmware, log, catalogue and FM-1 record. Export backups first.";
+#endif
         } else {
             frame.heading = "Delete backup?";
             frame.body = "Permanently removes this backup, even if it is your last copy. Export it first if needed.";
@@ -634,6 +828,36 @@ ui::Frame buildLocalFrame(const TransportStatus& transport) {
             {"Export information", "Keep a copy outside this device", "", false},
             {"Delete backup", deletable ? "Permanent; export first if needed" : "Unavailable / operation in progress", deletable ? "" : "LOCK", false}};
         appendWindow(frame, rows, backupAction);
+        frame.footer = menuHint;
+        return frame;
+    }
+    if (localPage == LocalPage::Storage) {
+        const uint64_t total = totalSpace(), free = freeSpace();
+        const unsigned used = total ? unsigned(((total - free) * 100 + total / 2) / total) : 0;
+        frame.screen = ui::Screen::Menu;
+        frame.title = "Storage";
+        frame.eyebrow = standard(readableBytes(free) + " FREE OF " + readableBytes(total));
+        frame.right = std::to_string(used) + "% USED";
+        std::vector<ui::Row> rows = {
+            {"Space", standard(readableBytes(free) + " free / " + readableBytes(total - free) + " used"), "", false},
+            {"Downloaded firmware", standard(groupSummary(storagePackages, packageChoices.size(), "packages")), "", false},
+            {"Backups", standard(groupSummary(storageBackups, storageBackups.bins, "backups")), "", false},
+            {"Session logs", standard(groupSummary(storageLogs, storageLogs.files, "logs")), "", false},
+            {"Erase all storage", "Backups, firmware, logs and records", "", false},
+            {"Export files", "Copy files off this device", "", false}};
+        appendWindow(frame, rows, storageSelected);
+        frame.footer = menuHint;
+        return frame;
+    }
+    if (localPage == LocalPage::StoragePackages) {
+        frame.screen = ui::Screen::Backups;
+        frame.title = "Firmware";
+        frame.eyebrow = "DOWNLOADED PACKAGES / CHOOSE TO DELETE";
+        frame.right = std::to_string(packageChoices.size()) + " FILES";
+        std::vector<ui::Row> rows;
+        for (const auto& package : packageChoices) rows.push_back({standard(package.label), standard(readableBytes(package.size)), "", false});
+        appendWindow(frame, rows, packageSelected);
+        if (rows.empty()) { frame.heading = "No downloaded firmware"; frame.body = "Packages saved from the Hub or uploaded in the browser appear here."; }
         frame.footer = menuHint;
         return frame;
     }
@@ -764,6 +988,11 @@ void paintLocalTick() {
     }
     if (busy) wasImport = jobBusy.load();
     wasBusy = busy;
+    // An FM-1 that goes away between operations (cable pulled, switched off)
+    // is otherwise only visible in the transport state; say so on screen.
+    static bool wasConnected = false;
+    if (wasConnected && !transport.connected && !busy) { notice = "FM-1 disconnected"; dirty = true; }
+    wasConnected = transport.connected;
     int wifi = WiFi.status();
     if (wifi != previousWifi) {
         previousWifi = wifi;

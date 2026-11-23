@@ -5,6 +5,7 @@
 #include "device/local_controller.h"
 #include <algorithm>
 #include "device/transport.h"
+#include <vector>
 #include "device/web_asset.h"
 #include "device/trust.h"
 #include "device/catalogue.h"
@@ -67,6 +68,14 @@ uint64_t freeSpace(){
  return LittleFS.totalBytes()-LittleFS.usedBytes();
 #endif
 }
+uint64_t totalSpace(){
+ if(!storageReady)return 0;
+#ifdef FM1_CARDPUTER
+ return SD.totalBytes();
+#else
+ return LittleFS.totalBytes();
+#endif
+}
 extern bool localReview;
 extern bool wifiConnecting;
 bool locked(){return networkPrompt||networkWaiting||localReview||pendingAction.active()||jobBusy.load()||exportActive||transportStatus().busy;}
@@ -75,6 +84,32 @@ String clipped(String v,size_t max){if(v.length()>max)v.remove(max);return v;}
 String fileId(const String& id){uint8_t hash[32];mbedtls_sha256((const uint8_t*)id.c_str(),id.length(),hash,0);String out;char hex[3];for(auto b:hash){snprintf(hex,sizeof(hex),"%02x",b);out+=hex;}return out;}
 String safeId(String v){String o;for(size_t i=0;i<v.length()&&o.length()<96;i++){char c=v[i];if(isalnum((unsigned char)c)||c=='-'||c=='_'||c=='.')o+=c;}return o;}
 bool safePath(const String& p){return p.startsWith("/fm1/")&&p.indexOf("..")<0&&p.indexOf('\\')<0;}
+// Interrupted downloads, uploads and backups leave *.part files that nothing
+// lists or reuses. Nothing is in progress at boot, so they are safe to drop.
+void removeStaleParts(){
+ for(const char* dirName:{"/fm1","/fm1/packages","/fm1/backups"}){
+  std::vector<String> stale;File dir=disk->open(dirName);
+  for(File f=dir.openNextFile();f;f=dir.openNextFile()){String name=f.name();if(!f.isDirectory()&&name.endsWith(".part"))stale.push_back(String(dirName)+"/"+name.substring(name.lastIndexOf('/')+1));}
+  dir.close();
+  for(auto& path:stale)disk->remove(path);
+ }
+}
+Entry readEntry(size_t index);
+// Download name for an exported file: "fm1-" + its file name; saved packages
+// (stored under a hash) use their catalogue name. Only [A-Za-z0-9._-] survive,
+// so the Content-Disposition value needs no escaping.
+String exportName(const String& path){
+ String base=path.substring(path.lastIndexOf('/')+1),ext=base.substring(base.lastIndexOf('.'));
+ if(path.startsWith("/fm1/packages/"))for(size_t i=0;i<entryCount;i++)if(entryIndex[i].localPath==path){String n=readEntry(i).name;n.replace(' ','-');n=safeId(n);if(n.length())base=n+"-"+readEntry(i).version+ext;break;}
+ base.replace(' ','-');base=safeId(base);
+ if(base.isEmpty()||base[0]=='.')base="export"+ext;
+ return base.startsWith("fm1")?base:"fm1-"+base;
+}
+const char* exportContentType(const String& name){
+ if(name.endsWith(".txt"))return "text/plain; charset=utf-8";
+ if(name.endsWith(".json"))return "application/json";
+ return "application/octet-stream";
+}
 class FileReader:public fm1::Reader { File& f; public: explicit FileReader(File& file):f(file){} uint64_t size()const override{return f.size();} bool read(uint64_t offset,uint8_t* out,size_t n)override{return offset<=UINT32_MAX&&f.seek((uint32_t)offset)&&f.read(out,n)==n;} };
 String validate(const String& path){File f=disk->open(path,FILE_READ);if(!f)return "Cannot open package";FileReader reader(f);fm1::PackageInfo info;auto e=fm1::validatePackage(reader,fm1::DeviceModel::Fm1,info);return e==fm1::PackageError::None?String():String(fm1::errorMessage(e));}
 void jobStatus(const String& stage,const String& message,uint32_t done=0,uint32_t total=0){xSemaphoreTake(jobMutex,portMAX_DELAY);jobStage=stage;jobDetail=message;jobCompleted=done;jobTotal=total;xSemaphoreGive(jobMutex);}
@@ -263,7 +298,7 @@ void configureWeb(){
  server.on("/api/wifi-power",HTTP_POST,[]{if(locked())return reject(409,"Operation in progress");String value=server.arg("enabled");if(value!="true"&&value!="false")return reject(400,"Use enabled=true or false");reject(202,value=="true"?"Turning Wi-Fi on":"Turning Wi-Fi radio off; browser connection will close");pendingWifiPower=value=="true"?1:0;hotspotChangeAt=millis()+300;if(pendingWifiPower==0)pendingHotspot=-1;});
  server.on("/api/hotspot",HTTP_POST,[]{if(locked())return reject(409,"Operation in progress");String enabled=server.arg("enabled");if(enabled!="true"&&enabled!="false")return reject(400,"Use enabled=true or false");bool next=enabled=="true";reject(202,next?"Enabling hotspot":"Disabling hotspot; use the home-network address or on-device controls to reconnect");pendingHotspot=next?1:0;hotspotChangeAt=millis()+300;});
  server.on("/api/files",HTTP_GET,[]{if(!storageReady||locked())return reject(409,"Storage unavailable or busy");JsonDocument d;auto a=d.to<JsonArray>();for(auto dirName:{"/fm1/packages","/fm1/backups","/fm1/logs"}){File dir=disk->open(dirName);for(File f=dir.openNextFile();f&&a.size()<96;f=dir.openNextFile()){if(f.isDirectory())continue;String name=f.name();if(name.endsWith(".part"))continue;auto o=a.add<JsonObject>();o["path"]=String(dirName)+"/"+name.substring(name.lastIndexOf('/')+1);o["size"]=f.size();o["deletableBackup"]=String(dirName)=="/fm1/backups"&&name.endsWith(".bin")&&transportCanDeleteBackup(o["path"].as<String>());}}sendJson(d);});
- server.on("/api/export",HTTP_GET,[]{String path=server.arg("path");if(!storageReady||locked())return reject(409,"Storage unavailable or busy");if(!safePath(path)||path.endsWith(".part")||path=="/fm1/ca.pem")return reject(400,"Invalid path");File f=disk->open(path);if(!f||f.isDirectory())return reject(404,"File missing");server.sendHeader("Content-Disposition","attachment");server.setContentLength(f.size());server.send(200,"application/octet-stream","");exportFile=f;exportClient=server.client();exportLast=millis();exportActive=true;});
+ server.on("/api/export",HTTP_GET,[]{String path=server.arg("path");if(!storageReady||locked())return reject(409,"Storage unavailable or busy");if(!safePath(path)||path.endsWith(".part")||path=="/fm1/ca.pem")return reject(400,"Invalid path");File f=disk->open(path);if(!f||f.isDirectory())return reject(404,"File missing");String name=exportName(path);server.sendHeader("Content-Disposition","attachment; filename=\""+name+"\"");server.sendHeader("X-Content-Type-Options","nosniff");server.sendHeader("Cache-Control","no-store");server.setContentLength(f.size());server.send(200,exportContentType(name),"");exportFile=f;exportClient=server.client();exportLast=millis();exportActive=true;});
  server.on("/api/cancel",HTTP_POST,[]{if(cancelOperation())reject(202,"Cancellation requested; finishing the current sector");else reject(409,"Operation is not cancellable at this stage");});
  server.on("/api/restore",HTTP_POST,[]{String path=server.arg("path");if(!storageReady||locked())return reject(409,"Storage unavailable or busy");if(!safePath(path)||!path.startsWith("/fm1/backups/")||!path.endsWith(".bin")||!disk->exists(path))return reject(400,"Select an existing backup .bin file");if(!pendingAction.arm(fm1::ActionKind::Restore,path.c_str(),path.c_str()))return reject(409,"Another confirmation is already armed");actionMenu=false;searchPicker=false;detail=false;confirmInstall=true;dirty=true;reject(202,"Restore armed. Hold the on-device confirmation control for two seconds to start; cancel on-device to dismiss.");});
  server.on("/api/delete-backup",HTTP_POST,[]{String path=server.arg("path");if(!storageReady||locked())return reject(409,"Storage unavailable or busy");if(!safePath(path)||!path.startsWith("/fm1/backups/")||!path.endsWith(".bin"))return reject(400,"Select a backup .bin file");if((pendingAction.active()&&path==pendingAction.snapshot().path)||!transportCanDeleteBackup(path))return reject(409,"Backup unavailable or operation in progress");if(!transportDeleteBackup(path))return reject(404,"Cannot remove backup");reject(200,"Backup deleted");});
@@ -304,7 +339,7 @@ void chooseAction() {
         if (!locked() && storageReady) transportBackup();
         else notice = "Storage unavailable or busy";
         break;
-    case 8: openBackups(); return;
+    case 8: backupsFromStorage = false; openBackups(); return;
     case 9: beginWifiScan(); return;
     case 10: refreshSelected(); break;
     case 11: {
@@ -327,16 +362,7 @@ void chooseAction() {
         sortOrder = sortOrder == "popular" ? "name" : sortOrder == "name" ? "newest" : "popular";
         selected = 0; dirty = true; return;
     case 15: favoritesOnly = !favoritesOnly; selected = 0; dirty = true; return;
-    case 16:
-        if (!storageReady) { localPage = LocalPage::Setup; actionMenu = false; dirty = true; }
-        else {
-#ifdef FM1_CARDPUTER
-            showLocalInfo("Storage", readableBytes(freeSpace()) + " free. Files are in /fm1 on the SD card. For browser access use Home > Web UI / hotspot.");
-#else
-            showLocalInfo("Storage", readableBytes(freeSpace()) + " free. For browser access use Home > Web UI / hotspot. Wi-Fi and normal switching work entirely on-device.");
-#endif
-        }
-        return;
+    case 16: openStorage(true); return;
     case 17: localPage=LocalPage::WebUi;actionMenu=false;hotspotSelected=0;dirty=true;return;
     case 18: {
         auto status = transportStatus();
@@ -353,7 +379,9 @@ void chooseAction() {
     if (!confirmInstall) actionMenu = false;
     dirty = true;
 }
-void exportTick(){if(!exportActive)return;int ready=exportClient.availableForWrite();if(ready>0&&exportFile.available()){uint8_t buffer[1024];size_t amount=std::min<size_t>(sizeof(buffer),ready);size_t got=exportFile.read(buffer,amount);size_t sent=exportClient.write(buffer,got);if(sent!=got){exportClient.stop();exportFile.close();exportActive=false;return;}exportLast=millis();}if(!exportFile.available()||!exportClient.connected()||millis()-exportLast>10000){exportFile.close();exportClient.stop();exportActive=false;}}
+// NetworkClient does not override Print::availableForWrite() (always 0), so gating on it
+// never sent a byte. write() blocks until the stack accepts the data or times out.
+void exportTick(){if(!exportActive)return;uint32_t tickStart=millis();for(int chunk=0;chunk<8&&exportFile.available()&&exportClient.connected()&&millis()-tickStart<20;chunk++){uint8_t buffer[1024];size_t got=exportFile.read(buffer,sizeof(buffer));if(!got)break;size_t sent=exportClient.write(buffer,got);if(sent!=got){exportClient.stop();exportFile.close();exportActive=false;return;}exportLast=millis();}if(!exportFile.available()||!exportClient.connected()||millis()-exportLast>10000){exportFile.close();exportClient.stop();exportActive=false;}}
 } // namespace
 void appSetup(){
  auto cfg=M5.config();cfg.internal_spk=false;cfg.internal_mic=false;
@@ -363,6 +391,9 @@ void appSetup(){
  cfg.fallback_board=m5::board_t::board_M5Cardputer;
 #else
  cfg.fallback_board=m5::board_t::board_M5StickS3;
+ // Grove/Hat 5 V (M5PM1 reg 0x06 bit 3) stays off. It does not reach USB-C
+ // (VBUS there measures ~0 V either way); the FM-1 runs on its own battery.
+ cfg.output_power=false;
 #endif
 #ifdef FM1_CARDPUTER
  M5Cardputer.begin(cfg,true);DISPLAY.setRotation(0); // Panel already has a 90-degree mounting offset.
@@ -377,7 +408,9 @@ void appSetup(){
  storageReady=LittleFS.begin(false);disk=&LittleFS;
 #endif
  if(storageReady){for(auto path:{"/fm1","/fm1/packages","/fm1/backups","/fm1/logs"})disk->mkdir(path);loadCatalogue();}else { notice="Storage setup needed"; localPage=LocalPage::Setup; }
- transportBegin(*disk);char pass[20];snprintf(pass,sizeof(pass),"fm1-%08lx",(unsigned long)(ESP.getEfuseMac()&0xffffffff));apPassword=pass;
+ if(storageReady)removeStaleParts();
+ transportBegin(*disk);
+ char pass[20];snprintf(pass,sizeof(pass),"fm1-%08lx",(unsigned long)(ESP.getEfuseMac()&0xffffffff));apPassword=pass;
  WiFi.onEvent([](arduino_event_id_t event,arduino_event_info_t info){
   if(event==ARDUINO_EVENT_WIFI_STA_DISCONNECTED)wifiDisconnectReason.store(info.wifi_sta_disconnected.reason);
  });
