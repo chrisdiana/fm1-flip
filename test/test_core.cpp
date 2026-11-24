@@ -29,18 +29,32 @@ void encrypt(uint8_t* p, size_t n) {
     key = uint16_t(key << 1) ^ ((key & 0x8000) ? 0x1021 : 0);
   }
 }
-std::vector<uint8_t> fixture(const char* product = "FM-1_015") {
-  constexpr size_t imageSize = 0x90 + 0x5000;
+// emptyEntry adds a zero-length type-2 file after flash.bin, as some real maker
+// packages do. emptyFlash makes flash.bin itself zero-length.
+std::vector<uint8_t> fixture(const char* product = "FM-1_015", bool emptyEntry = false,
+                             bool emptyFlash = false) {
+  const uint32_t count = emptyEntry ? 2 : 1;
+  const uint32_t data = 0x40 + 0x50 * count;
+  const uint32_t flashLength = emptyFlash ? 0 : 0x5000;
+  const size_t imageSize = data + 0x5000;
   std::vector<uint8_t> image(imageSize, 0x5a);
   uint8_t* entry = image.data() + 0x40;
   put16(entry, 0);  // upstream file type 0 is flash.bin
-  put16(entry + 4, crc16(image.data() + 0x90, 0x5000));
-  put32(entry + 8, 0x90);
-  put32(entry + 12, 0x5000);
-  encrypt(entry, 0x50);
-  put16(image.data() + 2, crc16(entry, 0x50));
+  put16(entry + 4, crc16(image.data() + data, flashLength));
+  put32(entry + 8, data);
+  put32(entry + 12, flashLength);
+  if (emptyEntry) {
+    uint8_t* empty = entry + 0x50;
+    put16(empty, 2);
+    put32(empty + 8, data + flashLength);
+    put32(empty + 12, 0);
+  }
+  put16(image.data() + 2, [&] {
+    for (uint32_t i = 0; i < count; ++i) encrypt(entry + 0x50 * i, 0x50);
+    return crc16(entry, 0x50 * count);
+  }());
   put32(image.data() + 4, image.size());
-  image[8] = 1;
+  image[8] = uint8_t(count);
   image[9] = 0;
   put16(image.data(), crc16(image.data() + 2, 0x3e));
   encrypt(image.data(), 0x40);
@@ -82,9 +96,19 @@ int main(int argc, char** argv) {
     std::printf("%s: %s; product=%s flash=%u blocks=%u\n", argv[i], fm1::errorMessage(error),
                 actual.product, actual.flashSize, actual.interleaveBlocks);
     assert(error == fm1::PackageError::None);
+    // Corrupt a byte inside flash.bin, which is always checksummed. The file's
+    // last bytes can belong to an entry type the parser does not checksum.
+    // The first interleaveBlocks raw 0x30-byte blocks each carry 0x2f logical
+    // bytes plus a marker; the rest of the file maps 1:1.
+    const uint64_t logical = actual.flashOffset + actual.flashSize / 2;
+    const uint64_t interleaved = uint64_t(actual.interleaveBlocks) * 0x2f;
+    const uint64_t raw = logical < interleaved
+                             ? logical / 0x2f * 0x30 + logical % 0x2f
+                             : uint64_t(actual.interleaveBlocks) * 0x30 + (logical - interleaved);
+    assert(raw < release.bytes.size());
     assert(fm1::validatePackage(release, smk ? fm1::DeviceModel::Fm1 : fm1::DeviceModel::Smk37, actual)
            == fm1::PackageError::WrongDevice);
-    release.bytes.back() ^= 1;
+    release.bytes[raw] ^= 1;
     assert(fm1::validatePackage(release, target, actual) != fm1::PackageError::None);
   }
   MemoryReader valid(fixture());
@@ -100,6 +124,12 @@ int main(int argc, char** argv) {
   assert(fm1::readFlashImage(valid, info, 0x4000, data, sizeof data) == fm1::PackageError::None);
   assert(data[0] == 0x5a && data[3] == 0x5a);
   assert(fm1::readFlashImage(valid, info, 0x5000, data, 1) == fm1::PackageError::InvalidFlashImage);
+
+  MemoryReader withEmpty(fixture("FM-1_015", true));
+  assert(fm1::validatePackage(withEmpty, fm1::DeviceModel::Fm1, info) == fm1::PackageError::None);
+  assert(info.flashSize == 0x5000);
+  MemoryReader emptyFlash(fixture("FM-1_015", false, true));
+  assert(fm1::validatePackage(emptyFlash, fm1::DeviceModel::Fm1, info) == fm1::PackageError::InvalidPackage);
 
   MemoryReader wrong(fixture("SMK-37 Elite_016"));
   assert(fm1::validatePackage(wrong, fm1::DeviceModel::Fm1, info) == fm1::PackageError::WrongDevice);
