@@ -160,7 +160,14 @@ bool flashEntry(Reader& r, uint32_t blocks, uint64_t logicalSize,
     const uint32_t expectedCrc = get16(entry + 4);
     const uint32_t offset = get32(entry + 8);
     const uint32_t length = get32(entry + 12);
-    if (!length || offset < tableEnd || offset > logicalSize || length > logicalSize - offset) return false;
+    if (offset < tableEnd || offset > logicalSize || length > logicalSize - offset) return false;
+    // Real maker packages (e.g. Bubba Machine 0.10.0-beta) list empty files.
+    // Upstream accepts them; they occupy no bytes, so skip overlap/CRC checks.
+    // An empty flash.bin is still invalid.
+    if (!length) {
+      if (type == 0) return false;
+      continue;
+    }
     for (uint32_t j = 0; j < i; ++j) {
       const uint64_t aEnd = uint64_t(offset) + length;
       const uint64_t bEnd = uint64_t(ranges[j][0]) + ranges[j][1];
